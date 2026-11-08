@@ -1,0 +1,7 @@
+config.js
+api-config.js
+.env
+.env.*
+!.env.example
+node_modules/
+.neon/

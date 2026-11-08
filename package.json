@@ -1,0 +1,17 @@
+{
+  "name": "nafis-038-neon-api",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20.19" },
+  "scripts": {
+    "test": "node --test",
+    "hash-password": "node scripts/hash-admin-password.mjs"
+  },
+  "dependencies": {
+    "@neon/functions": "^0.11.0",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@neon/config": "^1.13.0"
+  }
+}
