@@ -2,5 +2,10 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "crons": [
     { "path": "/api/cron/publish-results", "schedule": "0 15 * * 6" }
+  ],
+  "rewrites": [
+    { "source": "/api/auth/:path*", "destination": "/api/router?__nafis_path=auth/:path*" },
+    { "source": "/api/admin/:path*", "destination": "/api/router?__nafis_path=admin/:path*" },
+    { "source": "/api/student/:path*", "destination": "/api/router?__nafis_path=student/:path*" }
   ]
 }
