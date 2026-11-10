@@ -112,13 +112,19 @@ test('public results disclose scores but never the submitted answers or answer k
 });
 
 test('student attempt is scored and stored by the API without returning the answer key', async () => {
-  const saved=[];
-  const questions=[{id:5,question_number:1,question_text:'١ + ١؟',options:['٢','٣'],correct_answer:'أ',explanation:'سر الإجابة',image_url:null,skill:null}];
+  const saved=[];let draft={};
+  const questions=[
+    {id:5,question_number:1,question_text:'١ + ١؟',options:['٢','٣'],correct_answer:'أ',explanation:'سر الإجابة',image_url:null,skill:null},
+    {id:6,question_number:2,question_text:'٢ + ٢؟',options:['٣','٤'],correct_answer:'ب',explanation:'سر الإجابة',image_url:null,skill:null},
+  ];
   const db={
     async query(sql,params=[]) {
       if(sql.includes('FROM public.naf038_settings')) return {rows:[{id:1,current_week:'2026-W46',students_enabled:true,exam_minutes:40,results_published_week:null,results_published_at:null}]};
       if(sql.includes('FROM public.naf038_exams')) return {rows:[{id:8,grade:1,subject:'الرياضيات',week_start:'2026-11-09',duration_minutes:40,is_published:true}]};
       if(sql.includes('FROM public.naf038_questions')) return {rows:questions};
+      if(sql.includes('DELETE FROM public.naf038_drafts')) {draft=null;return {rowCount:1,rows:[]};}
+      if(sql.includes('FROM public.naf038_drafts')) return {rows:draft? [{answers:draft}]:[]};
+      if(sql.includes('INSERT INTO public.naf038_drafts')) {draft=JSON.parse(params[3]);return {rowCount:1,rows:[]};}
       if(sql.includes('INSERT INTO public.naf038_attempts')) {saved.push({sql,params});return {rowCount:1,rows:[]};}
       throw new Error('Unexpected database query');
     },
@@ -126,6 +132,7 @@ test('student attempt is scored and stored by the API without returning the answ
       if(sql==='BEGIN'||sql==='COMMIT'||sql==='ROLLBACK') return {rows:[]};
       if(sql.includes('INSERT INTO public.nafis_students')) return {rows:[{id:77}]};
       if(sql.includes('FROM public.naf038_attempts')) return {rows:[]};
+      if(sql.includes('FROM public.naf038_drafts')) return {rows:[]};
       if(sql.includes('FROM public.naf038_questions')) return {rows:questions};
       throw new Error('Unexpected transaction query');
     }}}
@@ -134,11 +141,16 @@ test('student attempt is scored and stored by the API without returning the answ
   assert.equal(start.status,200);
   const started=await start.json();
   assert.doesNotMatch(JSON.stringify(started),/correct_answer|سر الإجابة/);
-  const submitted=await handleRequest(request('/student/submit',{method:'POST',headers:{authorization:`Bearer ${started.exam_token}`},body:{answers:{5:'أ'}}}),{env:{...env,NAFIS_STUDENT_PORTAL_ENABLED:'true'},pool:db});
+  const savedDraft=await handleRequest(request('/student/draft',{method:'PUT',headers:{authorization:`Bearer ${started.exam_token}`},body:{answers:{5:'أ'}}}),{env:{...env,NAFIS_STUDENT_PORTAL_ENABLED:'true'},pool:db});
+  assert.equal(savedDraft.status,200);
+  assert.deepEqual(await savedDraft.json(),{saved:true});
+  assert.deepEqual(draft,{5:'أ'});
+  const submitted=await handleRequest(request('/student/submit',{method:'POST',headers:{authorization:`Bearer ${started.exam_token}`},body:{answers:{}}}),{env:{...env,NAFIS_STUDENT_PORTAL_ENABLED:'true'},pool:db});
   assert.equal(submitted.status,201);
   assert.match((await submitted.json()).message,/السبت الساعة ٦ مساءً/);
   assert.equal(saved.length,1);
   assert.equal(saved[0].params[4],1);
-  assert.equal(saved[0].params[6],1);
+  assert.equal(saved[0].params[6],2);
   assert.equal(saved[0].params[3],'{"5":"أ"}');
+  assert.equal(draft,null);
 });
