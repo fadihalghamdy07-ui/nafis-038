@@ -2,7 +2,7 @@ import { createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } fr
 import { promisify } from 'node:util';
 
 const scrypt = promisify(scryptCallback);
-const TABLES = ['nafis_students', 'naf038_settings', 'naf038_exams', 'naf038_questions', 'naf038_attempts'];
+const TABLES = ['nafis_students', 'naf038_settings', 'naf038_exams', 'naf038_questions', 'naf038_attempts', 'naf038_drafts'];
 const GRADES = new Map([[1, 'الأول متوسط'], [2, 'الثاني متوسط'], [3, 'الثالث متوسط']]);
 const SUBJECTS = new Set(['لغتي', 'الرياضيات', 'العلوم']);
 const LETTERS = ['أ', 'ب', 'ج', 'د', 'هـ', 'و'];
@@ -105,7 +105,7 @@ function corsHeaders(request, env) {
   if (!allowed.includes(origin)) return null;
   return {
     'access-control-allow-origin': origin,
-    'access-control-allow-methods': 'GET,POST,PATCH,OPTIONS',
+    'access-control-allow-methods': 'GET,POST,PUT,PATCH,OPTIONS',
     'access-control-allow-headers': 'authorization,content-type',
     'access-control-max-age': '600',
     vary: 'Origin',
@@ -292,19 +292,49 @@ async function studentStart(pool, body, env) {
     const studentId = student.rows[0].id;
     const prior = await client.query('SELECT id FROM public.naf038_attempts WHERE exam_id=$1 AND student_id=$2 LIMIT 1', [current.exam.id, studentId]);
     if (prior.rows.length) throw Object.assign(new Error('attempt_used'), { status: 409 });
+    const draftResult = await client.query('SELECT answers,started_at FROM public.naf038_drafts WHERE exam_id=$1 AND student_id=$2 LIMIT 1', [current.exam.id, studentId]);
+    const draft = draftResult.rows[0] || null;
     const qs = await examQuestions(client, current.exam.id, false);
     if (!qs.length) throw Object.assign(new Error('exam_empty'), { status: 404 });
-    const start = Math.floor(Date.now() / 1000);
+    const start = draft?.started_at ? Math.floor(new Date(draft.started_at).getTime() / 1000) : Math.floor(Date.now() / 1000);
+    const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - start);
+    if (elapsed >= Number(current.exam.duration_minutes) * 60) throw Object.assign(new Error('time_expired'), { status: 409 });
     const exp = start + Number(current.exam.duration_minutes) * 60 + 15 * 60;
     const token = signedToken({ role: 'exam', studentId, examId: current.exam.id, grade, section, subject, started: start, exp }, env.NAFIS_SESSION_SECRET);
     await client.query('COMMIT');
     return { exam: { id: current.exam.id, duration_minutes: current.exam.duration_minutes,
-      questions: qs.map(publicQuestion) }, exam_token: token };
+      questions: qs.map(publicQuestion) }, exam_token: token, saved_answers: draft?.answers || {}, remaining_seconds: Math.max(0, Number(current.exam.duration_minutes) * 60 - elapsed) };
   } catch (error) {
     await client.query('ROLLBACK');
     if (error.code === '23505') throw Object.assign(new Error('attempt_used'), { status: 409 });
     throw error;
   } finally { client.release(); }
+}
+async function studentSaveDraft(pool, body, token) {
+  const examId = Number(token.examId), studentId = Number(token.studentId), answers = body.answers;
+  if (!Number.isSafeInteger(examId) || !Number.isSafeInteger(studentId) || !answers || typeof answers !== 'object' || Array.isArray(answers))
+    throw Object.assign(new Error('invalid_submission'), { status: 400 });
+  const current = await currentExam(pool, Number(token.grade), token.subject);
+  if (current.error === 'closed' || !current.exam) throw Object.assign(new Error('students_closed'), { status: 423 });
+  if (String(current.exam.id) !== String(examId)) throw Object.assign(new Error('exam_changed'), { status: 409 });
+  const qs = await examQuestions(pool, examId, false);
+  const allowed = new Set(qs.map(q => String(q.id)));
+  const saved = {};
+  for (const [id, raw] of Object.entries(answers)) {
+    if (!allowed.has(String(id))) throw Object.assign(new Error('invalid_submission'), { status: 400 });
+    const answer = answerLetter(raw);
+    const q = qs.find(item => String(item.id) === String(id));
+    if (!answer || LETTERS.indexOf(answer) >= optionTexts(q.options).length) throw Object.assign(new Error('invalid_submission'), { status: 400 });
+    saved[id] = answer;
+  }
+  const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - Number(token.started));
+  if (elapsed > Number(current.exam.duration_minutes) * 60) throw Object.assign(new Error('time_expired'), { status: 409 });
+  await pool.query(`
+    INSERT INTO public.naf038_drafts(exam_id,student_id,started_at,answers,updated_at)
+    VALUES ($1,$2,to_timestamp($3),$4::jsonb,NOW())
+    ON CONFLICT (exam_id,student_id) DO UPDATE
+       SET answers=EXCLUDED.answers,updated_at=NOW()`, [examId, studentId, Number(token.started), JSON.stringify(saved)]);
+  return { saved: true };
 }
 async function studentSubmit(pool, body, token) {
   const examId = Number(token.examId), studentId = Number(token.studentId), answers = body.answers;
@@ -316,11 +346,14 @@ async function studentSubmit(pool, body, token) {
     throw Object.assign(new Error('time_expired'), { status: 409 });
   if (String(current.exam.id) !== String(examId)) throw Object.assign(new Error('exam_changed'), { status: 409 });
   const qs = await examQuestions(pool, examId, true);
-  if (!qs.length || Object.keys(answers).length !== qs.length) throw Object.assign(new Error('invalid_submission'), { status: 400 });
+  if (!qs.length) throw Object.assign(new Error('invalid_submission'), { status: 400 });
+  const draftResult = await pool.query('SELECT answers FROM public.naf038_drafts WHERE exam_id=$1 AND student_id=$2 LIMIT 1', [examId, studentId]);
+  const combined = { ...(draftResult.rows[0]?.answers || {}), ...answers };
   let score = 0;
   const saved = {};
   for (const q of qs) {
-    const raw = answers[q.id] ?? answers[String(q.id)];
+    const raw = combined[q.id] ?? combined[String(q.id)];
+    if (raw === undefined || raw === null || raw === '') continue;
     const answer = answerLetter(raw);
     const opts = optionTexts(q.options);
     if (!answer || LETTERS.indexOf(answer) >= opts.length) throw Object.assign(new Error('invalid_submission'), { status: 400 });
@@ -334,6 +367,7 @@ async function studentSubmit(pool, body, token) {
     await pool.query(`
       INSERT INTO public.naf038_attempts(exam_id, student_id, started_at, submitted_at, answers, score, duration_seconds, total_questions)
       VALUES ($1,$2,to_timestamp($3),NOW(),$4::jsonb,$5,$6,$7)`, [examId, studentId, Number(token.started), JSON.stringify(saved), score, elapsed, qs.length]);
+    await pool.query('DELETE FROM public.naf038_drafts WHERE exam_id=$1 AND student_id=$2', [examId, studentId]);
   } catch (error) {
     if (error.code === '23505') throw Object.assign(new Error('attempt_used'), { status: 409 });
     throw error;
@@ -498,6 +532,12 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
       const token = authExam(request, env);
       if (!token) return fail(401, 'exam_session_invalid', 'انتهت جلسة الاختبار.');
       return json(await studentSubmit(pool, await bodyJson(request), token), 201, headers);
+    }
+    if (request.method === 'PUT' && path === '/student/draft') {
+      if (env.NAFIS_STUDENT_PORTAL_ENABLED !== 'true') return fail(423, 'students_closed', 'المنصة مغلقة حاليًا.');
+      const token = authExam(request, env);
+      if (!token) return fail(401, 'exam_session_invalid', 'انتهت جلسة الاختبار.');
+      return json(await studentSaveDraft(pool, await bodyJson(request), token), 200, headers);
     }
     return fail(404, 'not_found', 'المسار غير موجود.');
   } catch (error) {
