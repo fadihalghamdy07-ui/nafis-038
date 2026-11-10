@@ -99,9 +99,12 @@ function authExam(request, env) {
 }
 function corsHeaders(request, env) {
   const origin = request.headers.get('origin');
+  if (!origin) return {};
+  // Same-origin calls do not require CORS headers or an allowlist entry.
+  // Keep the allowlist check for cross-origin callers only.
+  if (origin === new URL(request.url).origin) return {};
   const allowed = (env.NAFIS_ALLOWED_ORIGINS || 'https://fadihalghamdy07-ui.github.io')
     .split(',').map(x => x.trim()).filter(Boolean);
-  if (!origin) return {};
   if (!allowed.includes(origin)) return null;
   return {
     'access-control-allow-origin': origin,
