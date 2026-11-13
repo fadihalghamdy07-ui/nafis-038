@@ -100,10 +100,25 @@ function authExam(request, env) {
 }
 function authCertificates(request, env) {
   const value = request.headers.get('authorization') || '';
-  const token = value.startsWith('Bearer ') ? value.slice(7) : '';
-  const payload = env.NAFIS_SESSION_SECRET ? readToken(token, env.NAFIS_SESSION_SECRET) : null;
-  return payload?.role === 'student_certificates' && Number.isSafeInteger(Number(payload.sub)) && Number(payload.sub) > 0
-    ? { ...payload, studentId: Number(payload.sub) } : null;
+  const cookieToken = (request.headers.get('cookie') || '').split(';').map(part => part.trim())
+    .find(part => part.startsWith('naf038_student_session='))?.slice('naf038_student_session='.length) || '';
+  const bearer = value.startsWith('Bearer ') ? value.slice(7) : '';
+  const payloads = env.NAFIS_SESSION_SECRET ? [bearer,cookieToken].filter(Boolean)
+    .map(token => readToken(token,env.NAFIS_SESSION_SECRET)) : [];
+  const payload = payloads.find(item => item?.role === 'student_certificates' &&
+    Number.isSafeInteger(Number(item.sub)) && Number(item.sub) > 0);
+  if (!payload) return null;
+  if (payload.source === 'exam-submit' && (!Array.isArray(payload.examIds) || !payload.examIds.length ||
+      payload.examIds.some(id => !Number.isSafeInteger(Number(id)) || Number(id) < 1))) return null;
+  return { ...payload, studentId:Number(payload.sub) };
+}
+function studentSessionCookie(studentId, examId, request, secret, now) {
+  const issued = Math.floor(now / 1000), expires = issued + 30 * 24 * 60 * 60;
+  const prior = authCertificates(new Request(request.url,{headers:{cookie:request.headers.get('cookie')||''}}),{NAFIS_SESSION_SECRET:secret});
+  const priorIds = prior?.source==='exam-submit'&&prior.studentId===Number(studentId)?prior.examIds.map(Number):[];
+  const examIds = [...new Set([...priorIds,Number(examId)])].slice(-100);
+  const token = signedToken({ sub:String(studentId), role:'student_certificates', source:'exam-submit', examIds, iat:issued, exp:expires }, secret);
+  return `naf038_student_session=${token}; Path=/api; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict`;
 }
 function studentAccessHash(code) {
   return createHash('sha256').update(String(code)).digest('hex');
@@ -449,7 +464,7 @@ async function studentSubmit(pool, body, token) {
   }
   return { accepted: true, message: 'تم تسليم إجابتك وحفظها بسرية. تُعلن النتائج تلقائيًا يوم السبت الساعة ٦ مساءً بتوقيت السعودية.' };
 }
-async function collectStudentAchievements(pool, studentId, secret, now) {
+async function collectStudentAchievements(pool, studentId, secret, now, examIds = null) {
   const { rows } = await pool.query(`
     WITH released AS (
       SELECT s.id AS student_id, s.full_name AS student_name, e.id AS exam_id,
@@ -473,8 +488,8 @@ async function collectStudentAchievements(pool, studentId, secret, now) {
         FROM released
     )
     SELECT student_id,student_name,exam_id,grade,subject,week,score,total,duration_seconds,rank
-      FROM ranked WHERE student_id=$1
-     ORDER BY week DESC,grade,subject`, [studentId, new Date(now).toISOString()]);
+      FROM ranked WHERE student_id=$1 AND ($3::bigint[] IS NULL OR exam_id=ANY($3::bigint[]))
+     ORDER BY week DESC,grade,subject`, [studentId, new Date(now).toISOString(), examIds]);
   const certificates = [];
   for (const row of rows) {
     const common = { student_name:row.student_name, grade:gradeText(row.grade), subject:row.subject,
@@ -577,7 +592,9 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
       const leaders = [...byStudent.values()].map(x => ({ name:x.name, grade:x.grade, section:x.section,
         percentage:Math.round(x.sum/x.completed*100), completed:x.completed }))
         .sort((a,b) => b.percentage-a.percentage || b.completed-a.completed || a.name.localeCompare(b.name,'ar')).slice(0,10);
-      return json({ published:true, week:resultWeek, published_at:settings.results_published_at, leaders, results }, 200, headers);
+      // Public callers may learn that release happened, but student identities and scores are private.
+      return json({ published:true, week:resultWeek, published_at:settings.results_published_at,
+        total_attempts:results.length }, 200, headers);
     }
     if (request.method === 'POST' && path === '/auth/login') {
       const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
@@ -602,18 +619,25 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
         WHERE access_hash=$1 AND revoked_at IS NULL LIMIT 1`,[studentAccessHash(code)]);
       if (!rows[0]) return fail(401,'invalid_student_access_code','تعذر التحقق من رمز الطالبة.');
       const issued=Math.floor(now()/1000), exp=issued+30*60;
-      const token=signedToken({sub:String(rows[0].student_id),role:'student_certificates',access:rows[0].access_hash,iat:issued,exp},env.NAFIS_SESSION_SECRET);
+      const token=signedToken({sub:String(rows[0].student_id),role:'student_certificates',source:'access-code',access:rows[0].access_hash,iat:issued,exp},env.NAFIS_SESSION_SECRET);
       return json({token,expires_at:exp},200,headers);
     }
     if (request.method === 'GET' && path === '/student/achievements') {
       const student=authCertificates(request,env);
-      if (!student) return fail(401,'student_access_required','يلزم رمز الطالبة الخاص لعرض الإنجازات.');
-      const access=await pool.query(`SELECT access_hash FROM public.naf038_student_access
-        WHERE student_id=$1 AND revoked_at IS NULL LIMIT 1`,[student.studentId]);
-      if (!access.rows[0] || !safeEqualText(access.rows[0].access_hash,student.access||''))
-        return fail(401,'student_access_revoked','انتهت صلاحية رمز الوصول؛ تواصلي مع إدارة المدرسة.');
-      const certificates=await collectStudentAchievements(pool,student.studentId,env.NAFIS_SESSION_SECRET,now());
+      if (!student) return fail(401,'student_access_required','تحتاجين جلسة اختبار سابقة أو رمز وصول صادرًا من الإدارة.');
+      if (student.source === 'access-code') {
+        const access=await pool.query(`SELECT access_hash FROM public.naf038_student_access
+          WHERE student_id=$1 AND revoked_at IS NULL LIMIT 1`,[student.studentId]);
+        if (!access.rows[0] || !safeEqualText(access.rows[0].access_hash,student.access||''))
+          return fail(401,'student_access_revoked','انتهت صلاحية رمز الوصول؛ تواصلي مع إدارة المدرسة.');
+      } else if (student.source !== 'exam-submit') {
+        return fail(401,'student_access_invalid','جلسة عرض الإنجازات غير صالحة.');
+      }
+      const certificates=await collectStudentAchievements(pool,student.studentId,env.NAFIS_SESSION_SECRET,now(),student.source==='exam-submit'?student.examIds.map(Number):null);
       return json({certificates},200,headers);
+    }
+    if (request.method === 'POST' && path === '/student/achievements/logout') {
+      return json({ cleared:true },200,{...headers,'set-cookie':'naf038_student_session=; Path=/api; Max-Age=0; HttpOnly; Secure; SameSite=Strict'});
     }
     const verifyCertificate=/^\/student\/certificate\/verify\/([^/]+)$/.exec(path);
     if (request.method==='GET' && verifyCertificate) {
@@ -784,7 +808,8 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
       if (env.NAFIS_STUDENT_PORTAL_ENABLED !== 'true') return fail(423, 'students_closed', 'المنصة مغلقة حاليًا.');
       const token = authExam(request, env);
       if (!token) return fail(401, 'exam_session_invalid', 'انتهت جلسة الاختبار.');
-      return json(await studentSubmit(pool, await bodyJson(request), token), 201, headers);
+      const result = await studentSubmit(pool, await bodyJson(request), token);
+      return json(result, 201, {...headers,'set-cookie':studentSessionCookie(token.studentId,token.examId,request,env.NAFIS_SESSION_SECRET,now())});
     }
     if (request.method === 'PUT' && path === '/student/draft') {
       if (env.NAFIS_STUDENT_PORTAL_ENABLED !== 'true') return fail(423, 'students_closed', 'المنصة مغلقة حاليًا.');
