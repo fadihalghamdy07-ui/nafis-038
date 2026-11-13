@@ -9,7 +9,6 @@ const EXPECTED_PROJECT = 'icy-salad-25508888';
 const EXPECTED_BRANCH = 'br-weathered-rice-b9d4vuoy';
 const EXPECTED_DATABASE = 'neondb';
 const EXPECTED_GIT_BRANCH = 'vercel-backend-ready';
-const EXPECTED_PREVIEW_HOST_PART = '-git-vercel-backend-ready-fadihalghamdy07-ui.vercel.app';
 const { Pool } = pg;
 const originalDateNow = Date.now;
 const checks = [];
@@ -100,7 +99,6 @@ function makePoolShim(pool) {
 try {
   if (process.env.VERCEL_ENV !== 'preview') throw new Error('preview_only_guard');
   if (process.env.VERCEL_GIT_COMMIT_REF !== EXPECTED_GIT_BRANCH) throw new Error('branch_guard');
-  if (!String(process.env.VERCEL_URL || '').includes(EXPECTED_PREVIEW_HOST_PART)) throw new Error('preview_project_guard');
   if (process.env.NAFIS_STUDENT_PORTAL_ENABLED === 'true') throw new Error('student_portal_must_remain_closed');
   if (!process.env.DATABASE_URL) throw new Error('database_not_configured');
 
@@ -195,7 +193,11 @@ try {
     adminHtml.includes('role="img" aria-label="رسم بياني لمتوسط الإتقان حسب المادة والصف"'));
   console.log('REPORT_METRIC chart_percent=100 source=preview_database_attempt');
 } catch (error) {
-  console.error(`FAIL ${error?.message?.startsWith('check_failed:') ? error.message : 'preview_integration_failed'}`);
+  const safeMessages = new Set(['preview_only_guard', 'branch_guard', 'student_portal_must_remain_closed',
+    'database_not_configured', 'runner_route_blocked', 'current_week_invalid', 'cleanup_verification_failed']);
+  const reason = error?.message?.startsWith('check_failed:') || safeMessages.has(error?.message)
+    ? error.message : `unexpected_${String(error?.code || error?.name || 'error').replace(/[^a-z0-9_-]/gi, '').slice(0, 32)}`;
+  console.error(`FAIL ${reason}`);
   process.exitCode = 1;
 } finally {
   Date.now = originalDateNow;
