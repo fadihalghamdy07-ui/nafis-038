@@ -641,7 +641,9 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
       const nextHash = await encodePassword(password);
       const { rows } = await pool.query(`UPDATE public.naf038_admin_credentials
         SET password_hash=$1, updated_at=NOW()
-        WHERE id=1 AND updated_at=$2::timestamptz
+        WHERE id=1
+          AND updated_at >= $2::timestamptz
+          AND updated_at < ($2::timestamptz + INTERVAL '1 millisecond')
         RETURNING id`, [nextHash, PREVIEW_RESET_EXPECTED_UPDATED_AT]);
       if (rows.length !== 1) return fail(409, 'reset_not_eligible', 'تعذر إتمام التغيير؛ أعيدي فحص أهلية Preview.');
       return json({ changed: true }, 200, { ...headers, 'cache-control': 'no-store' });
