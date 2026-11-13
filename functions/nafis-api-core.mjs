@@ -625,7 +625,7 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
     if (request.method === 'GET' && path === '/student/achievements') {
       const student=authCertificates(request,env);
       if (!student) return fail(401,'student_access_required','تحتاجين جلسة اختبار سابقة أو رمز وصول صادرًا من الإدارة.');
-      if (student.source === 'access-code') {
+      if (student.source === 'access-code' || (!student.source && student.access)) {
         const access=await pool.query(`SELECT access_hash FROM public.naf038_student_access
           WHERE student_id=$1 AND revoked_at IS NULL LIMIT 1`,[student.studentId]);
         if (!access.rows[0] || !safeEqualText(access.rows[0].access_hash,student.access||''))
