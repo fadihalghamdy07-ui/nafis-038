@@ -366,16 +366,33 @@ async function verifyPassword(password, encoded) {
   const actual = await scrypt(password, Buffer.from(salt64, 'base64url'), expected.length);
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
-async function activeAdminPasswordHash(pool, fallback) {
-  if (!pool) return fallback;
+function adminHashFormat(encoded) {
+  if (!encoded) return 'missing';
+  const parts = String(encoded).split('$');
+  if (parts.length !== 3 || parts[0] !== 'scrypt' || !/^[A-Za-z0-9_-]+$/.test(parts[1]) || !/^[A-Za-z0-9_-]+$/.test(parts[2])) return 'invalid';
+  try {
+    return Buffer.from(parts[1], 'base64url').length === 16 && Buffer.from(parts[2], 'base64url').length === 64
+      ? 'scrypt-16-64' : 'invalid';
+  } catch { return 'invalid'; }
+}
+async function activeAdminCredential(pool, fallback) {
+  if (!pool) return { hash:fallback, source:fallback ? 'environment' : 'missing', database_state:'not_checked' };
   try {
     const { rows } = await pool.query('SELECT password_hash FROM public.naf038_admin_credentials WHERE id=1 LIMIT 1');
-    return rows[0]?.password_hash || fallback;
+    if (rows[0]?.password_hash) return { hash:rows[0].password_hash, source:'database', database_state:'present' };
+    return { hash:fallback, source:fallback ? 'environment' : 'missing', database_state:'no_row' };
   } catch (error) {
     // Preserve existing environment-based login until the additive migration is applied.
-    if (error?.code === '42P01') return fallback;
+    if (error?.code === '42P01') return { hash:fallback, source:fallback ? 'environment' : 'missing', database_state:'table_missing' };
     throw error;
   }
+}
+function sessionSigningDiagnostic(secret) {
+  if (!secret) return false;
+  try {
+    const token=signedToken({role:'diagnostic',exp:Math.floor(Date.now()/1000)+60},secret);
+    return readToken(token,secret)?.role==='diagnostic';
+  } catch { return false; }
 }
 async function encodePassword(password) {
   const salt = randomBytes(16);
@@ -538,6 +555,23 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
       const isolatedPreview=env.VERCEL_ENV==='preview'&&env.VERCEL_GIT_COMMIT_REF==='vercel-backend-ready'&&
         identity.database_name==='neondb'&&identity.neon_project_id==='icy-salad-25508888'&&
         identity.neon_branch_id==='br-weathered-rice-b9d4vuoy';
+      if (url.searchParams.get('auth_diag')==='1' && env.VERCEL_ENV==='preview' && env.VERCEL_GIT_COMMIT_REF==='vercel-backend-ready') {
+        try {
+          const credential=await activeAdminCredential(pool,env.NAFIS_ADMIN_PASSWORD_HASH);
+          const email=String(env.NAFIS_ADMIN_EMAIL||'');
+          console.info('nafis_admin_auth_diagnostic',{
+            environment:'preview',branch:'vercel-backend-ready',isolated_preview_database:isolatedPreview,
+            admin_email_state:!email?'missing':email===email.trim()?'configured':'configured_with_outer_whitespace',
+            environment_hash_format:adminHashFormat(env.NAFIS_ADMIN_PASSWORD_HASH),
+            active_hash_source:credential.source,active_hash_format:adminHashFormat(credential.hash),
+            database_credential_state:credential.database_state,
+            session_secret_present:Boolean(env.NAFIS_SESSION_SECRET),
+            session_signing_self_test:sessionSigningDiagnostic(env.NAFIS_SESSION_SECRET),
+          });
+        } catch {
+          console.warn('nafis_admin_auth_diagnostic',{environment:'preview',branch:'vercel-backend-ready',diagnostic_state:'query_failed'});
+        }
+      }
       return json({ ok: true, isolated_preview_database: isolatedPreview }, 200, headers);
     }
     if (request.method === 'GET' && path === '/student/status') {
@@ -617,13 +651,32 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
     }
     if (request.method === 'POST' && path === '/auth/login') {
       const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
-      if (!requestLimiter(ip)) return fail(429, 'rate_limited', 'حاولي بعد 15 دقيقة.');
+      if (!requestLimiter(ip)) {
+        console.warn('nafis_admin_auth_rejected',{reason_codes:['rate_limited'],environment:env.VERCEL_ENV||'unknown'});
+        return fail(429, 'rate_limited', 'حاولي بعد 15 دقيقة.');
+      }
       const body = await bodyJson(request);
       const email = trim(body.email, 254).toLowerCase();
-      const correctEmail = safeEqualText(email, (env.NAFIS_ADMIN_EMAIL || '').toLowerCase());
-      const passwordHash = await activeAdminPasswordHash(pool, env.NAFIS_ADMIN_PASSWORD_HASH);
+      const configuredEmail=String(env.NAFIS_ADMIN_EMAIL||'');
+      const correctEmail = safeEqualText(email, configuredEmail.toLowerCase());
+      const credential = await activeAdminCredential(pool, env.NAFIS_ADMIN_PASSWORD_HASH);
+      const passwordHash = credential.hash;
       const correctPassword = await verifyPassword(String(body.password || ''), passwordHash);
-      if (!correctEmail || !correctPassword || !env.NAFIS_SESSION_SECRET) return fail(401, 'invalid_login', 'بيانات الدخول غير صحيحة.');
+      if (!correctEmail || !correctPassword || !env.NAFIS_SESSION_SECRET) {
+        const reasons=[];
+        if (!configuredEmail) reasons.push('admin_email_missing');
+        else if (!correctEmail) reasons.push('email_mismatch');
+        if (adminHashFormat(passwordHash)==='missing') reasons.push('password_hash_missing');
+        else if (adminHashFormat(passwordHash)==='invalid') reasons.push('password_hash_format_invalid');
+        else if (!correctPassword) reasons.push('password_mismatch');
+        if (!env.NAFIS_SESSION_SECRET) reasons.push('session_secret_missing');
+        console.warn('nafis_admin_auth_rejected',{
+          reason_codes:reasons,hash_source:credential.source,database_credential_state:credential.database_state,
+          session_signing_self_test:sessionSigningDiagnostic(env.NAFIS_SESSION_SECRET),
+          environment:env.VERCEL_ENV||'unknown',branch_matches:env.VERCEL_GIT_COMMIT_REF==='vercel-backend-ready',
+        });
+        return fail(401, 'invalid_login', 'بيانات الدخول غير صحيحة.');
+      }
       const issued = Math.floor(now() / 1000), exp = issued + 8 * 60 * 60;
       const token = signedToken({ sub: email, role: 'admin', iat: issued, exp }, env.NAFIS_SESSION_SECRET);
       return json({ token, expires_at: exp, email }, 200, headers);
@@ -762,7 +815,7 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
         const currentPassword = String(body.current_password || '');
         const newPassword = String(body.new_password || '');
         if (newPassword.length < 14) return fail(400, 'weak_password', 'اختاري كلمة مرور من 14 محرفًا على الأقل.');
-        const passwordHash = await activeAdminPasswordHash(pool, env.NAFIS_ADMIN_PASSWORD_HASH);
+        const passwordHash = (await activeAdminCredential(pool, env.NAFIS_ADMIN_PASSWORD_HASH)).hash;
         if (!await verifyPassword(currentPassword, passwordHash))
           return fail(401, 'current_password_invalid', 'كلمة المرور الحالية غير صحيحة.');
         const nextHash = await encodePassword(newPassword);
