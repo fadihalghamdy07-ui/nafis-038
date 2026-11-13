@@ -9,9 +9,6 @@ const LETTERS = ['أ', 'ب', 'ج', 'د', 'هـ', 'و'];
 const MAX_BODY_BYTES = 1_000_000;
 const loginAttempts = new Map();
 const studentCodeAttempts = new Map();
-// One-use Preview-only recovery guard bound to the verified active Neon row.
-const PREVIEW_RESET_EXPECTED_UPDATED_AT = '2026-11-13T10:04:47.159Z';
-
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), {
   status,
   headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers },
@@ -616,37 +613,6 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
       // Public callers may learn that release happened, but student identities and scores are private.
       return json({ published:true, week:resultWeek, published_at:settings.results_published_at,
         total_attempts:results.length }, 200, headers);
-    }
-    if (path === '/auth/preview-password-reset') {
-      if (env.VERCEL_ENV !== 'preview' || env.VERCEL_GIT_COMMIT_REF !== 'vercel-backend-ready')
-        return fail(404, 'not_found', 'المسار غير موجود.');
-      const identityResult = await pool.query(`SELECT current_database() AS database_name,
-        current_setting('neon.project_id',true) AS neon_project_id,
-        current_setting('neon.branch_id',true) AS neon_branch_id`);
-      const identity = identityResult.rows[0] || {};
-      const isolatedPreview = identity.database_name === 'neondb' &&
-        identity.neon_project_id === 'icy-salad-25508888' && identity.neon_branch_id === 'br-weathered-rice-b9d4vuoy';
-      if (!isolatedPreview) return fail(404, 'not_found', 'المسار غير موجود.');
-      if (request.method === 'GET') {
-        const { rows } = await pool.query('SELECT updated_at FROM public.naf038_admin_credentials WHERE id=1 LIMIT 1');
-        const updatedAt = rows[0]?.updated_at ? new Date(rows[0].updated_at).toISOString() : null;
-        return json({ eligible: updatedAt === PREVIEW_RESET_EXPECTED_UPDATED_AT,
-          target: 'Neon Preview · صف اعتماد الإدارة 1' }, 200, { ...headers, 'cache-control': 'no-store' });
-      }
-      if (request.method !== 'POST') return fail(405, 'method_not_allowed', 'الطريقة غير مسموحة.');
-      const body = await bodyJson(request);
-      const password = typeof body.new_password === 'string' ? body.new_password : '';
-      if (password.length < 14 || password.length > 128)
-        return fail(400, 'invalid_new_password', 'استخدمي كلمة مرور من 14 إلى 128 محرفًا.');
-      const nextHash = await encodePassword(password);
-      const { rows } = await pool.query(`UPDATE public.naf038_admin_credentials
-        SET password_hash=$1, updated_at=NOW()
-        WHERE id=1
-          AND updated_at >= $2::timestamptz
-          AND updated_at < ($2::timestamptz + INTERVAL '1 millisecond')
-        RETURNING id`, [nextHash, PREVIEW_RESET_EXPECTED_UPDATED_AT]);
-      if (rows.length !== 1) return fail(409, 'reset_not_eligible', 'تعذر إتمام التغيير؛ أعيدي فحص أهلية Preview.');
-      return json({ changed: true }, 200, { ...headers, 'cache-control': 'no-store' });
     }
     if (request.method === 'POST' && path === '/auth/login') {
       const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
