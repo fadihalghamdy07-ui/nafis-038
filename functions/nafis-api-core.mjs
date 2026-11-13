@@ -673,6 +673,10 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
     }
     if (path.startsWith('/admin/')) {
       const admin = adminOnly(request, env); if (admin instanceof Response) return json({ error: 'admin_login_required' }, 401, headers);
+      if (request.method === 'POST' && path === '/admin/preview-e2e') {
+        const { runPreviewE2E } = await import('./preview-e2e.mjs');
+        return runPreviewE2E({ pool, env, request, handleRequest });
+      }
       if (request.method === 'GET' && path === '/admin/bootstrap') {
         const [settings, questions, exams, attempts, students] = await Promise.all([
           readSettings(pool), collectQuestions(pool), collectExams(pool), collectAttempts(pool),
