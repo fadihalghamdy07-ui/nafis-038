@@ -19,6 +19,14 @@ CREATE TABLE IF NOT EXISTS public.naf038_drafts (
   PRIMARY KEY (exam_id, student_id)
 );
 
+-- Store an optional replacement admin password hash after an authenticated change.
+-- The initial login hash remains in the server-side environment until changed here.
+CREATE TABLE IF NOT EXISTS public.naf038_admin_credentials (
+  id smallint PRIMARY KEY CHECK (id = 1),
+  password_hash text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT NOW()
+);
+
 -- Enforce one submitted attempt for each student and exam at the database layer.
 DO $$
 BEGIN
@@ -39,7 +47,7 @@ DO $$
 DECLARE t text;
 DECLARE policy_name text;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['nafis_students','naf038_settings','naf038_exams','naf038_questions','naf038_attempts','naf038_drafts'] LOOP
+  FOREACH t IN ARRAY ARRAY['nafis_students','naf038_settings','naf038_exams','naf038_questions','naf038_attempts','naf038_drafts','naf038_admin_credentials'] LOOP
     IF to_regclass(format('public.%I', t)) IS NULL THEN
       RAISE EXCEPTION 'Required Nafis table is missing: public.%', t;
     END IF;
@@ -58,5 +66,6 @@ END $$;
 
 -- Prevent accidental direct browser access through roles typically used by client apps.
 REVOKE ALL ON public.nafis_students, public.naf038_settings, public.naf038_exams,
-  public.naf038_questions, public.naf038_attempts, public.naf038_drafts FROM PUBLIC;
+  public.naf038_questions, public.naf038_attempts, public.naf038_drafts,
+  public.naf038_admin_credentials FROM PUBLIC;
 

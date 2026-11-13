@@ -2,7 +2,7 @@ import { createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } fr
 import { promisify } from 'node:util';
 
 const scrypt = promisify(scryptCallback);
-const TABLES = ['nafis_students', 'naf038_settings', 'naf038_exams', 'naf038_questions', 'naf038_attempts', 'naf038_drafts'];
+const TABLES = ['nafis_students', 'naf038_settings', 'naf038_exams', 'naf038_questions', 'naf038_attempts', 'naf038_drafts', 'naf038_admin_credentials'];
 const GRADES = new Map([[1, 'الأول متوسط'], [2, 'الثاني متوسط'], [3, 'الثالث متوسط']]);
 const SUBJECTS = new Set(['لغتي', 'الرياضيات', 'العلوم']);
 const LETTERS = ['أ', 'ب', 'ج', 'د', 'هـ', 'و'];
@@ -276,6 +276,22 @@ async function verifyPassword(password, encoded) {
   const actual = await scrypt(password, Buffer.from(salt64, 'base64url'), expected.length);
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
+async function activeAdminPasswordHash(pool, fallback) {
+  if (!pool) return fallback;
+  try {
+    const { rows } = await pool.query('SELECT password_hash FROM public.naf038_admin_credentials WHERE id=1 LIMIT 1');
+    return rows[0]?.password_hash || fallback;
+  } catch (error) {
+    // Preserve existing environment-based login until the additive migration is applied.
+    if (error?.code === '42P01') return fallback;
+    throw error;
+  }
+}
+async function encodePassword(password) {
+  const salt = randomBytes(16);
+  const hash = await scrypt(password, salt, 64);
+  return `scrypt$${salt.toString('base64url')}$${hash.toString('base64url')}`;
+}
 async function studentStart(pool, body, env) {
   const name = trim(body.name, 120), section = trim(body.section, 4), grade = Number(body.grade), subject = trim(body.subject, 40);
   if (name.split(/\s+/u).length < 4 || !GRADES.has(grade) || !/^[1-4]$/.test(section) || !SUBJECTS.has(subject))
@@ -460,7 +476,8 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
       const body = await bodyJson(request);
       const email = trim(body.email, 254).toLowerCase();
       const correctEmail = safeEqualText(email, (env.NAFIS_ADMIN_EMAIL || '').toLowerCase());
-      const correctPassword = await verifyPassword(String(body.password || ''), env.NAFIS_ADMIN_PASSWORD_HASH);
+      const passwordHash = await activeAdminPasswordHash(pool, env.NAFIS_ADMIN_PASSWORD_HASH);
+      const correctPassword = await verifyPassword(String(body.password || ''), passwordHash);
       if (!correctEmail || !correctPassword || !env.NAFIS_SESSION_SECRET) return fail(401, 'invalid_login', 'بيانات الدخول غير صحيحة.');
       const issued = Math.floor(now() / 1000), exp = issued + 8 * 60 * 60;
       const token = signedToken({ sub: email, role: 'admin', iat: issued, exp }, env.NAFIS_SESSION_SECRET);
@@ -481,6 +498,24 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
         if (!settings) throw Object.assign(new Error('missing_settings'), { status: 503 });
         return json({ settings, questions, exams, attempts, students_count: students.rows[0].count,
           portal_armed: env.NAFIS_STUDENT_PORTAL_ENABLED === 'true' }, 200, headers);
+      }
+      if (request.method === 'POST' && path === '/admin/password') {
+        const body = await bodyJson(request);
+        const currentPassword = String(body.current_password || '');
+        const newPassword = String(body.new_password || '');
+        if (newPassword.length < 14) return fail(400, 'weak_password', 'اختاري كلمة مرور من 14 محرفًا على الأقل.');
+        const passwordHash = await activeAdminPasswordHash(pool, env.NAFIS_ADMIN_PASSWORD_HASH);
+        if (!await verifyPassword(currentPassword, passwordHash))
+          return fail(401, 'current_password_invalid', 'كلمة المرور الحالية غير صحيحة.');
+        const nextHash = await encodePassword(newPassword);
+        try {
+          await pool.query(`INSERT INTO public.naf038_admin_credentials(id,password_hash,updated_at)
+            VALUES (1,$1,NOW()) ON CONFLICT (id) DO UPDATE SET password_hash=EXCLUDED.password_hash,updated_at=NOW()`, [nextHash]);
+        } catch (error) {
+          if (error?.code === '42P01') return fail(503, 'password_change_unavailable', 'طبّقي ترحيل نافس على Neon أولًا ثم أعيدي المحاولة.');
+          throw error;
+        }
+        return json({ changed: true }, 200, headers);
       }
       if (request.method === 'POST' && path === '/admin/questions') {
         const result = await addQuestions(pool, (await bodyJson(request)).questions);

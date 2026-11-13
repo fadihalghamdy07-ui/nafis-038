@@ -41,6 +41,27 @@ test('login issues an eight-hour token after checking the server-side scrypt has
   assert.equal(result.expires_at, 1_800_028_800);
 });
 
+test('admin changes password after reauthentication and the stored hash supersedes the environment hash', async () => {
+  const salt = randomBytes(16), currentPassword = 'current-test-password-long';
+  const digest = await scrypt(currentPassword, salt, 64);
+  const secureEnv = { ...env, NAFIS_ADMIN_PASSWORD_HASH:`scrypt$${salt.toString('base64url')}$${digest.toString('base64url')}` };
+  let storedHash = null;
+  const pool = { async query(sql, params=[]) {
+    if (sql.includes('SELECT password_hash FROM public.naf038_admin_credentials')) return { rows:storedHash?[{password_hash:storedHash}]:[] };
+    if (sql.includes('INSERT INTO public.naf038_admin_credentials')) { storedHash=params[0]; return { rows:[] }; }
+    throw new Error('Unexpected query');
+  } };
+  const login = await handleRequest(request('/auth/login', { method:'POST', body:{ email:env.NAFIS_ADMIN_EMAIL, password:currentPassword } }), { env:secureEnv, pool });
+  const { token } = await login.json();
+  const changed = await handleRequest(request('/admin/password', { method:'POST', headers:{authorization:`Bearer ${token}`}, body:{current_password:currentPassword,new_password:'new-test-password-long'} }), { env:secureEnv, pool });
+  assert.equal(changed.status, 200);
+  assert.deepEqual(await changed.json(), { changed:true });
+  const oldLogin = await handleRequest(request('/auth/login', { method:'POST', body:{ email:env.NAFIS_ADMIN_EMAIL, password:currentPassword } }), { env:secureEnv, pool });
+  assert.equal(oldLogin.status, 401);
+  const newLogin = await handleRequest(request('/auth/login', { method:'POST', body:{ email:env.NAFIS_ADMIN_EMAIL, password:'new-test-password-long' } }), { env:secureEnv, pool });
+  assert.equal(newLogin.status, 200);
+});
+
 test('admin cannot open the student gate while Neon deployment gate is off', async () => {
   const salt = randomBytes(16), password = 'test-password-long-enough';
   const digest = await scrypt(password, salt, 64);
