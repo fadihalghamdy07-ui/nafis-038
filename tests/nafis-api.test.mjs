@@ -30,6 +30,48 @@ test('admin endpoints reject requests without a signed admin session', async () 
   assert.equal(response.status, 401);
 });
 
+test('documentation center requires an admin session and keeps every saved version append-only', async () => {
+  const salt = randomBytes(16), password = 'documentation-test-password';
+  const digest = await scrypt(password, salt, 64);
+  const secureEnv = { ...env, NAFIS_ADMIN_PASSWORD_HASH:`scrypt$${salt.toString('base64url')}$${digest.toString('base64url')}` };
+  const versions=[];
+  const pool={async query(sql,params=[]) {
+    if(sql.includes('SELECT password_hash FROM public.naf038_admin_credentials')) return {rows:[]};
+    if(sql.includes('FROM public.naf038_document_versions ORDER BY') && sql.includes('restored_from,document')) return {rows:versions.length?[versions[versions.length-1]]:[]};
+    if(sql.includes('FROM public.naf038_document_versions ORDER BY')) return {rows:[...versions].reverse().map(({document,...meta})=>meta)};
+    if(sql.includes('INSERT INTO public.naf038_document_versions') && sql.includes('SELECT $1')) {
+      const prior=versions.find(x=>x.version_id===Number(params[2])); if(!prior)return {rows:[]};
+      const row={version_id:versions.length+1,created_at:'2026-11-13T12:00:00.000Z',actor_email:params[0],action:'restore',change_summary:params[1],restored_from:prior.version_id,document:prior.document};versions.push(row);return {rows:[row]};
+    }
+    if(sql.includes('INSERT INTO public.naf038_document_versions')) {
+      const row={version_id:versions.length+1,created_at:'2026-11-13T12:00:00.000Z',actor_email:params[0],action:params[1],change_summary:params[2],document:JSON.parse(params[3])};versions.push(row);return {rows:[row]};
+    }
+    throw new Error('Unexpected query');
+  }};
+  const anonymous=await handleRequest(request('/admin/documentation'),{env:secureEnv,pool});
+  assert.equal(anonymous.status,401);
+  const login=await handleRequest(request('/auth/login',{method:'POST',body:{email:env.NAFIS_ADMIN_EMAIL,password}}),{env:secureEnv,pool});
+  const {token}=await login.json();
+  const session={authorization:`Bearer ${token}`};
+  const doc={initiative:{idea:'فكرة',rationale:'مبرر',objectives:'هدف',audience:'طالبات',founded_at:'2026-11-13',stages:'تجريب'},team:[{name:'مسؤولة',role:'إشراف'}],milestones:[],attachments:[],approval:{authority:'مدرسة',approver:'مديرة',date:'2026-11-13'}};
+  const save=await handleRequest(request('/admin/documentation',{method:'POST',headers:session,body:{document:doc,change_summary:'تأسيس أولي',action:'create'}}),{env:secureEnv,pool});
+  assert.equal(save.status,201);
+  const saved=await save.json();
+  assert.equal(saved.current.actor_email,env.NAFIS_ADMIN_EMAIL);
+  const update=await handleRequest(request('/admin/documentation',{method:'POST',headers:session,body:{document:{...doc,initiative:{...doc.initiative,idea:'تحديث'}},change_summary:'تعديل الفكرة'}}),{env:secureEnv,pool});
+  assert.equal(update.status,201);
+  const restored=await handleRequest(request('/admin/documentation/versions/1/restore',{method:'POST',headers:session,body:{change_summary:'استعادة المراجعة'}}),{env:secureEnv,pool});
+  assert.equal(restored.status,201);
+  const result=await restored.json();
+  assert.equal(result.current.action,'restore');
+  assert.equal(result.current.restored_from,1);
+  assert.equal(result.current.document.initiative.idea,'فكرة');
+  assert.equal(versions.length,3);
+  const history=await handleRequest(request('/admin/documentation',{headers:session}),{env:secureEnv,pool});
+  assert.equal(history.status,200);
+  assert.equal((await history.json()).versions.length,3);
+});
+
 test('login issues an eight-hour token after checking the server-side scrypt hash', async () => {
   const salt = randomBytes(16), password = 'test-password-long-enough';
   const digest = await scrypt(password, salt, 64);

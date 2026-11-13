@@ -118,6 +118,32 @@ function adminOnly(request, env) {
   const admin = authAdmin(request, env);
   return admin || fail(401, 'admin_login_required', 'يلزم تسجيل دخول الإدارة.');
 }
+
+function validateDocumentation(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const allowed = new Set(['initiative', 'team', 'milestones', 'attachments', 'approval']);
+  if (Object.keys(value).some(key => !allowed.has(key))) return false;
+  const strings = [
+    value.initiative?.idea, value.initiative?.rationale, value.initiative?.objectives,
+    value.initiative?.audience, value.initiative?.founded_at,
+    value.initiative?.stages, value.approval?.authority, value.approval?.approver,
+    value.approval?.date,
+  ];
+  if (strings.some(x => typeof x !== 'string' || x.length > 12000)) return false;
+  if (!Array.isArray(value.team) || value.team.length > 40 || value.team.some(person =>
+    !person || typeof person.name !== 'string' || person.name.length > 180 ||
+    typeof person.role !== 'string' || person.role.length > 300)) return false;
+  if (!Array.isArray(value.milestones) || value.milestones.length > 200 || value.milestones.some(item =>
+    !item || typeof item.title !== 'string' || item.title.length > 250 ||
+    typeof item.date !== 'string' || item.date.length > 40 ||
+    typeof item.description !== 'string' || item.description.length > 2000)) return false;
+  if (!Array.isArray(value.attachments) || value.attachments.length > 10 || value.attachments.some(file =>
+    !file || typeof file.name !== 'string' || file.name.length > 150 ||
+    !['image/png','image/jpeg','application/pdf'].includes(file.type) ||
+    typeof file.data !== 'string' || file.data.length > 700000 ||
+    !file.data.startsWith(`data:${file.type};base64,`))) return false;
+  return true;
+}
 async function readSettings(pool) {
   const { rows } = await pool.query('SELECT id, current_week, students_enabled, exam_minutes, results_published_week, results_published_at FROM public.naf038_settings WHERE id = 1 LIMIT 1');
   return rows[0] || null;
@@ -498,6 +524,54 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
         if (!settings) throw Object.assign(new Error('missing_settings'), { status: 503 });
         return json({ settings, questions, exams, attempts, students_count: students.rows[0].count,
           portal_armed: env.NAFIS_STUDENT_PORTAL_ENABLED === 'true' }, 200, headers);
+      }
+      if (request.method === 'GET' && path === '/admin/documentation') {
+        try {
+          const [current, history] = await Promise.all([
+            pool.query(`SELECT version_id,created_at,actor_email,action,change_summary,restored_from,document
+              FROM public.naf038_document_versions ORDER BY version_id DESC LIMIT 1`),
+            pool.query(`SELECT version_id,created_at,actor_email,action,change_summary,restored_from
+              FROM public.naf038_document_versions ORDER BY version_id DESC`),
+          ]);
+          return json({ current: current.rows[0] || null, versions: history.rows }, 200, headers);
+        } catch (error) {
+          if (error?.code === '42P01') return fail(503, 'documentation_migration_required', 'مركز التوثيق غير مهيأ في قاعدة Preview بعد.');
+          throw error;
+        }
+      }
+      if (request.method === 'POST' && path === '/admin/documentation') {
+        const body = await bodyJson(request);
+        const summary = trim(body.change_summary, 500);
+        if (!summary || !validateDocumentation(body.document))
+          return fail(400, 'invalid_documentation', 'راجعي حقول الوثيقة والمرفقات قبل الحفظ.');
+        try {
+          const { rows } = await pool.query(`INSERT INTO public.naf038_document_versions
+            (actor_email,action,change_summary,document)
+            VALUES ($1,$2,$3,$4::jsonb)
+            RETURNING version_id,created_at,actor_email,action,change_summary,document`,
+          [admin.sub, body.action === 'create' ? 'create' : 'update', summary, JSON.stringify(body.document)]);
+          return json({ saved: true, current: rows[0] }, 201, headers);
+        } catch (error) {
+          if (error?.code === '42P01') return fail(503, 'documentation_migration_required', 'مركز التوثيق غير مهيأ في قاعدة Preview بعد.');
+          throw error;
+        }
+      }
+      const restoreDocumentation = /^\/admin\/documentation\/versions\/(\d+)\/restore$/.exec(path);
+      if (restoreDocumentation && request.method === 'POST') {
+        const body = await bodyJson(request);
+        const summary = trim(body.change_summary, 500);
+        if (!summary) return fail(400, 'invalid_documentation', 'اكتبي سبب استعادة الإصدار.');
+        try {
+          const { rows } = await pool.query(`INSERT INTO public.naf038_document_versions
+            (actor_email,action,change_summary,restored_from,document)
+            SELECT $1,'restore',$2,version_id,document FROM public.naf038_document_versions
+             WHERE version_id=$3 RETURNING version_id,created_at,actor_email,action,change_summary,restored_from,document`,
+          [admin.sub, summary, restoreDocumentation[1]]);
+          return rows[0] ? json({ restored: true, current: rows[0] }, 201, headers) : fail(404, 'version_not_found', 'الإصدار المطلوب غير موجود.');
+        } catch (error) {
+          if (error?.code === '42P01') return fail(503, 'documentation_migration_required', 'مركز التوثيق غير مهيأ في قاعدة Preview بعد.');
+          throw error;
+        }
       }
       if (request.method === 'POST' && path === '/admin/password') {
         const body = await bodyJson(request);
