@@ -3,4 +3,6 @@ node_modules
 .git
 tests
 scripts
+!scripts/
+!scripts/preview-integration.mjs
 *.zip
