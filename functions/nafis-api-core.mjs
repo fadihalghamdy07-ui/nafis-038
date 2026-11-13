@@ -376,14 +376,14 @@ function adminHashFormat(encoded) {
   } catch { return 'invalid'; }
 }
 async function activeAdminCredential(pool, fallback) {
-  if (!pool) return { hash:fallback, source:fallback ? 'environment' : 'missing', database_state:'not_checked' };
+  if (!pool) return { hash:fallback, source:fallback ? 'environment' : 'missing', database_state:'not_checked', updated_at:null };
   try {
-    const { rows } = await pool.query('SELECT password_hash FROM public.naf038_admin_credentials WHERE id=1 LIMIT 1');
-    if (rows[0]?.password_hash) return { hash:rows[0].password_hash, source:'database', database_state:'present' };
-    return { hash:fallback, source:fallback ? 'environment' : 'missing', database_state:'no_row' };
+    const { rows } = await pool.query('SELECT password_hash, updated_at FROM public.naf038_admin_credentials WHERE id=1 LIMIT 1');
+    if (rows[0]?.password_hash) return { hash:rows[0].password_hash, source:'database', database_state:'present', updated_at:rows[0].updated_at || null };
+    return { hash:fallback, source:fallback ? 'environment' : 'missing', database_state:'no_row', updated_at:null };
   } catch (error) {
     // Preserve existing environment-based login until the additive migration is applied.
-    if (error?.code === '42P01') return { hash:fallback, source:fallback ? 'environment' : 'missing', database_state:'table_missing' };
+    if (error?.code === '42P01') return { hash:fallback, source:fallback ? 'environment' : 'missing', database_state:'table_missing', updated_at:null };
     throw error;
   }
 }
@@ -564,7 +564,7 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
             admin_email_state:!email?'missing':email===email.trim()?'configured':'configured_with_outer_whitespace',
             environment_hash_format:adminHashFormat(env.NAFIS_ADMIN_PASSWORD_HASH),
             active_hash_source:credential.source,active_hash_format:adminHashFormat(credential.hash),
-            database_credential_state:credential.database_state,
+            database_credential_state:credential.database_state,active_hash_updated_at:credential.updated_at,
             session_secret_present:Boolean(env.NAFIS_SESSION_SECRET),
             session_signing_self_test:sessionSigningDiagnostic(env.NAFIS_SESSION_SECRET),
           });
