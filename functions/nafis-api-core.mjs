@@ -616,13 +616,25 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
     }
     if (request.method === 'POST' && path === '/auth/login') {
       const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
-      if (!requestLimiter(ip)) return fail(429, 'rate_limited', 'حاولي بعد 15 دقيقة.');
+      if (!requestLimiter(ip)) {
+        console.info('naf038_admin_login_denied', { reason: 'rate_limited' });
+        return fail(429, 'rate_limited', 'حاولي بعد 15 دقيقة.');
+      }
       const body = await bodyJson(request);
       const email = trim(body.email, 254).toLowerCase();
-      const correctEmail = safeEqualText(email, (env.NAFIS_ADMIN_EMAIL || '').toLowerCase());
+      const configuredEmail = String(env.NAFIS_ADMIN_EMAIL || '').trim().toLowerCase();
+      const correctEmail = safeEqualText(email, configuredEmail);
       const passwordHash = await activeAdminPasswordHash(pool, env.NAFIS_ADMIN_PASSWORD_HASH);
       const correctPassword = await verifyPassword(String(body.password || ''), passwordHash);
-      if (!correctEmail || !correctPassword || !env.NAFIS_SESSION_SECRET) return fail(401, 'invalid_login', 'بيانات الدخول غير صحيحة.');
+      if (!correctEmail || !correctPassword || !env.NAFIS_SESSION_SECRET) {
+        const reason = !configuredEmail ? 'admin_email_missing'
+          : !correctEmail ? 'email_mismatch'
+          : !passwordHash ? 'password_hash_missing'
+          : !correctPassword ? 'password_mismatch'
+          : 'session_secret_missing';
+        console.info('naf038_admin_login_denied', { reason });
+        return fail(401, 'invalid_login', 'بيانات الدخول غير صحيحة.');
+      }
       const issued = Math.floor(now() / 1000), exp = issued + 8 * 60 * 60;
       const token = signedToken({ sub: email, role: 'admin', iat: issued, exp }, env.NAFIS_SESSION_SECRET);
       return json({ token, expires_at: exp, email }, 200, headers);
