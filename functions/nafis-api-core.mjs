@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 13417)
-Total output lines: 816
-
 import { createHash, createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 
@@ -357,7 +354,209 @@ async function studentStart(pool, body, env) {
     throw Object.assign(new Error('invalid_student'), { status: 400 });
   const current = await currentExam(pool, grade, subject, { ensureFinish:true });
   if (current.error === 'closed') throw Object.assign(new Error('students_closed'), { status: 423 });
-  if (current.error || !curr…3417 tokens truncated…LECT COUNT(*)::integer FROM public.naf038_questions q WHERE q.exam_id=e.id)) AS total,
+  if (current.error || !current.exam) throw Object.assign(new Error('exam_unavailable'), { status: 404 });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const student = await client.query(`
+      INSERT INTO public.nafis_students(full_name, grade, section)
+      VALUES ($1,$2,$3)
+      ON CONFLICT (lower(btrim(full_name)), grade, lower(btrim(section)))
+      DO UPDATE SET section=EXCLUDED.section
+      RETURNING id`, [name, grade, section]);
+    const studentId = student.rows[0].id;
+    const prior = await client.query('SELECT id FROM public.naf038_attempts WHERE exam_id=$1 AND student_id=$2 LIMIT 1', [current.exam.id, studentId]);
+    if (prior.rows.length) throw Object.assign(new Error('attempt_used'), { status: 409 });
+    const draftResult = await client.query('SELECT answers,started_at FROM public.naf038_drafts WHERE exam_id=$1 AND student_id=$2 LIMIT 1', [current.exam.id, studentId]);
+    const draft = draftResult.rows[0] || null;
+    const qs = await examQuestions(client, current.exam.id, false);
+    if (!qs.length) throw Object.assign(new Error('exam_empty'), { status: 404 });
+    const start = draft?.started_at ? Math.floor(new Date(draft.started_at).getTime() / 1000) : Math.floor(Date.now() / 1000);
+    const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - start);
+    if (elapsed >= Number(current.exam.duration_minutes) * 60) throw Object.assign(new Error('time_expired'), { status: 409 });
+    const exp = start + Number(current.exam.duration_minutes) * 60 + 15 * 60;
+    const token = signedToken({ role: 'exam', studentId, examId: current.exam.id, grade, section, subject, started: start, exp }, env.NAFIS_SESSION_SECRET);
+    await client.query('COMMIT');
+    return { exam: { id: current.exam.id, duration_minutes: current.exam.duration_minutes,
+      questions: qs.map(publicQuestion) }, exam_token: token, saved_answers: draft?.answers || {}, remaining_seconds: Math.max(0, Number(current.exam.duration_minutes) * 60 - elapsed) };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error.code === '23505') throw Object.assign(new Error('attempt_used'), { status: 409 });
+    throw error;
+  } finally { client.release(); }
+}
+async function studentSaveDraft(pool, body, token) {
+  const examId = Number(token.examId), studentId = Number(token.studentId), answers = body.answers;
+  if (!Number.isSafeInteger(examId) || !Number.isSafeInteger(studentId) || !answers || typeof answers !== 'object' || Array.isArray(answers))
+    throw Object.assign(new Error('invalid_submission'), { status: 400 });
+  const current = await currentExam(pool, Number(token.grade), token.subject);
+  if (current.error === 'closed' || !current.exam) throw Object.assign(new Error('students_closed'), { status: 423 });
+  if (String(current.exam.id) !== String(examId)) throw Object.assign(new Error('exam_changed'), { status: 409 });
+  const qs = await examQuestions(pool, examId, false);
+  const allowed = new Set(qs.map(q => String(q.id)));
+  const saved = {};
+  for (const [id, raw] of Object.entries(answers)) {
+    if (!allowed.has(String(id))) throw Object.assign(new Error('invalid_submission'), { status: 400 });
+    const answer = answerLetter(raw);
+    const q = qs.find(item => String(item.id) === String(id));
+    if (!answer || LETTERS.indexOf(answer) >= optionTexts(q.options).length) throw Object.assign(new Error('invalid_submission'), { status: 400 });
+    saved[id] = answer;
+  }
+  const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - Number(token.started));
+  if (elapsed > Number(current.exam.duration_minutes) * 60) throw Object.assign(new Error('time_expired'), { status: 409 });
+  await pool.query(`
+    INSERT INTO public.naf038_drafts(exam_id,student_id,started_at,answers,updated_at)
+    VALUES ($1,$2,to_timestamp($3),$4::jsonb,NOW())
+    ON CONFLICT (exam_id,student_id) DO UPDATE
+       SET answers=EXCLUDED.answers,updated_at=NOW()`, [examId, studentId, Number(token.started), JSON.stringify(saved)]);
+  return { saved: true };
+}
+async function studentSubmit(pool, body, token) {
+  const examId = Number(token.examId), studentId = Number(token.studentId), answers = body.answers;
+  if (!Number.isSafeInteger(examId) || !Number.isSafeInteger(studentId) || !answers || typeof answers !== 'object' || Array.isArray(answers))
+    throw Object.assign(new Error('invalid_submission'), { status: 400 });
+  const current = await currentExam(pool, Number(token.grade), token.subject);
+  if (current.error === 'closed' || !current.exam) throw Object.assign(new Error('students_closed'), { status: 423 });
+  if (Date.now() >= announcementAt(current.settings?.current_week))
+    throw Object.assign(new Error('time_expired'), { status: 409 });
+  if (String(current.exam.id) !== String(examId)) throw Object.assign(new Error('exam_changed'), { status: 409 });
+  const qs = await examQuestions(pool, examId, true);
+  if (!qs.length) throw Object.assign(new Error('invalid_submission'), { status: 400 });
+  const draftResult = await pool.query('SELECT answers FROM public.naf038_drafts WHERE exam_id=$1 AND student_id=$2 LIMIT 1', [examId, studentId]);
+  const combined = { ...(draftResult.rows[0]?.answers || {}), ...answers };
+  let score = 0;
+  const saved = {};
+  for (const q of qs) {
+    const raw = combined[q.id] ?? combined[String(q.id)];
+    if (raw === undefined || raw === null || raw === '') continue;
+    const answer = answerLetter(raw);
+    const opts = optionTexts(q.options);
+    if (!answer || LETTERS.indexOf(answer) >= opts.length) throw Object.assign(new Error('invalid_submission'), { status: 400 });
+    saved[q.id] = answer;
+    if (answer === answerLetter(q.correct_answer)) score++;
+  }
+  const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - Number(token.started));
+  const maxDuration = Number(current.exam.duration_minutes) * 60;
+  if (!Number.isFinite(elapsed) || elapsed > maxDuration + 60) throw Object.assign(new Error('time_expired'), { status: 409 });
+  try {
+    await pool.query(`
+      INSERT INTO public.naf038_attempts(exam_id, student_id, started_at, submitted_at, answers, score, duration_seconds, total_questions)
+      VALUES ($1,$2,to_timestamp($3),NOW(),$4::jsonb,$5,$6,$7)`, [examId, studentId, Number(token.started), JSON.stringify(saved), score, elapsed, qs.length]);
+    await pool.query('DELETE FROM public.naf038_drafts WHERE exam_id=$1 AND student_id=$2', [examId, studentId]);
+  } catch (error) {
+    if (error.code === '23505') throw Object.assign(new Error('attempt_used'), { status: 409 });
+    throw error;
+  }
+  return { accepted: true, message: 'تم تسليم إجابتك وحفظها بسرية. تُعلن النتائج تلقائيًا يوم السبت الساعة ٦ مساءً بتوقيت السعودية.' };
+}
+async function collectStudentAchievements(pool, studentId, secret, now) {
+  const { rows } = await pool.query(`
+    WITH released AS (
+      SELECT s.id AS student_id, s.full_name AS student_name, e.id AS exam_id,
+             e.grade, e.subject, p.week_key AS week,
+             a.score::integer AS score,
+             COALESCE(a.total_questions,(SELECT COUNT(*)::integer FROM public.naf038_questions q WHERE q.exam_id=e.id))::integer AS total,
+             a.duration_seconds, a.submitted_at
+        FROM public.naf038_attempts a
+        JOIN public.nafis_students s ON s.id=a.student_id
+        JOIN public.naf038_exams e ON e.id=a.exam_id
+        JOIN public.naf038_results_publications p
+          ON p.week_key=to_char(e.week_start,'IYYY-"W"IW')
+         AND p.published_at <= $2::timestamptz
+         AND p.published_at >= ((date_trunc('week',e.week_start::timestamp) + INTERVAL '5 days 15 hours') AT TIME ZONE 'UTC')
+         AND a.submitted_at <= p.published_at
+    ), ranked AS (
+      SELECT released.*,
+             ROW_NUMBER() OVER (PARTITION BY grade,subject,week
+               ORDER BY score::numeric / NULLIF(total,0) DESC,
+                        duration_seconds ASC, submitted_at ASC, student_id ASC) AS rank
+        FROM released
+    )
+    SELECT student_id,student_name,exam_id,grade,subject,week,score,total,duration_seconds,rank
+      FROM ranked WHERE student_id=$1
+     ORDER BY week DESC,grade,subject`, [studentId, new Date(now).toISOString()]);
+  const certificates = [];
+  for (const row of rows) {
+    const common = { student_name:row.student_name, grade:gradeText(row.grade), subject:row.subject,
+      week:row.week, score:Number(row.score), total:Number(row.total) };
+    certificates.push({ ...common, type:'participation', title:'شهادة مشاركة', medal:null,
+      verification_code:certificateProof(row.student_id,row.exam_id,'participation',secret) });
+    const rank=Number(row.rank), medals={1:['gold','ذهبية','🥇'],2:['silver','فضية','🥈'],3:['bronze','برونزية','🥉']};
+    if (medals[rank]) certificates.push({ ...common, type:medals[rank][0], title:`شهادة تميز ${medals[rank][1]}`,
+      medal:medals[rank][2], rank, verification_code:certificateProof(row.student_id,row.exam_id,medals[rank][0],secret) });
+  }
+  return certificates;
+}
+async function handleRequest(request, { pool, env = process.env, now = () => Date.now() } = {}) {
+  const cors = corsHeaders(request, env);
+  if (cors === null) return fail(403, 'origin_not_allowed', 'مصدر الطلب غير مسموح.');
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors || {} });
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/\/$/, '') || '/';
+  const headers = cors || {};
+  try {
+    if (request.method === 'GET' && path === '/health') {
+      if (!pool) return json({ ok: false }, 503, headers);
+      const {rows}=await pool.query(`SELECT current_database() AS database_name,
+        current_setting('neon.project_id',true) AS neon_project_id,
+        current_setting('neon.branch_id',true) AS neon_branch_id`);
+      const identity=rows[0]||{};
+      const isolatedPreview=env.VERCEL_ENV==='preview'&&env.VERCEL_GIT_COMMIT_REF==='vercel-backend-ready'&&
+        identity.database_name==='neondb'&&identity.neon_project_id==='icy-salad-25508888'&&
+        identity.neon_branch_id==='br-weathered-rice-b9d4vuoy';
+      return json({ ok: true, isolated_preview_database: isolatedPreview }, 200, headers);
+    }
+    if (request.method === 'GET' && path === '/student/status') {
+      if (env.NAFIS_STUDENT_PORTAL_ENABLED !== 'true')
+        return json({ open: false }, 200, headers);
+      const settings = await readSettings(pool);
+      const closesAt = announcementAt(settings?.current_week);
+      return json({ open: Boolean(settings?.students_enabled && closesAt && now() < closesAt) }, 200, headers);
+    }
+    if (request.method === 'POST' && path === '/internal/publish-results') {
+      // Neon removes client-supplied X-Neon-* headers, so this header identifies scheduled calls.
+      if (!request.headers.get('x-neon-trigger-invocation-id'))
+        return fail(401, 'trigger_only', 'هذا المسار مخصص لجدولة Neon.');
+      const body = await bodyJson(request);
+      const scheduledAt = body?.data?.scheduled_at;
+      const scheduledTime = Date.parse(scheduledAt || '');
+      if (!Number.isFinite(scheduledTime)) return fail(400, 'invalid_trigger_time', 'وقت الجدولة غير صالح.');
+      const scheduledDate = new Date(scheduledTime);
+      const scheduledWeek = weekKey(scheduledAt);
+      if (scheduledDate.getUTCDay() !== 6 || scheduledDate.getUTCHours() !== 15 ||
+          scheduledDate.getUTCMinutes() !== 0 || scheduledDate.getUTCSeconds() !== 0)
+        return fail(400, 'invalid_trigger_time', 'موعد الإعلان المجدول غير مطابق للسبت الساعة السادسة مساءً بتوقيت السعودية.');
+      const result = await pool.query(`
+        WITH updated AS (
+          UPDATE public.naf038_settings
+             SET results_published_week=$2,
+                 results_published_at=$1::timestamptz,
+                 updated_at=NOW()
+           WHERE id=1
+           RETURNING current_week,results_published_at
+        ), publication AS (
+          INSERT INTO public.naf038_results_publications(week_key,published_at)
+          SELECT $2,$1::timestamptz FROM updated
+          ON CONFLICT (week_key) DO UPDATE SET published_at=EXCLUDED.published_at
+          RETURNING week_key,published_at
+        )
+        SELECT updated.current_week,publication.published_at
+          FROM updated JOIN publication ON publication.week_key=$2`, [new Date(scheduledTime).toISOString(), scheduledWeek]);
+      const published = result.rows[0];
+      if (!published) throw Object.assign(new Error('missing_settings'), { status: 503 });
+      console.log('nafis_results_published', { week: scheduledWeek, scheduled_at: new Date(scheduledTime).toISOString() });
+      return json({ published: true, week: scheduledWeek, results_published_at: published.results_published_at }, 200, headers);
+    }
+    if (request.method === 'GET' && path === '/student/results') {
+      const settings = await readSettings(pool);
+      const resultWeek = settings?.results_published_week;
+      const announcementTime = announcementAt(resultWeek);
+      const published = resultWeek && settings?.results_published_at &&
+        weekKey(settings.results_published_at) === resultWeek && now() >= announcementTime;
+      if (!published) return json({ published: false, available_at: announcementTime ? new Date(announcementTime).toISOString() : null }, 200, headers);
+      const { rows } = await pool.query(`
+        SELECT s.full_name AS student_name, s.grade, s.section, e.subject, a.score,
+               COALESCE(a.total_questions,(SELECT COUNT(*)::integer FROM public.naf038_questions q WHERE q.exam_id=e.id)) AS total,
                a.submitted_at
           FROM public.naf038_attempts a
           JOIN public.nafis_students s ON s.id=a.student_id
