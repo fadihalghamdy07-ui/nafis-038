@@ -4,7 +4,6 @@
   "type": "module",
   "engines": { "node": ">=20.19" },
   "scripts": {
-    "postinstall": "node scripts/preview-integration.mjs",
     "test": "node --test",
     "hash-password": "node scripts/hash-admin-password.mjs"
   },
