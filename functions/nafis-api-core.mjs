@@ -124,13 +124,32 @@ function studentAccessHash(code) {
   return createHash('sha256').update(String(code)).digest('hex');
 }
 function certificateProof(studentId, examId, award, secret) {
-  const payload = Buffer.from(JSON.stringify({ v: 1, student_id: Number(studentId), exam_id: Number(examId), award })).toString('base64url');
-  return `${payload}.${createHmac('sha256', secret).update(payload).digest('base64url')}`;
+  const awards={participation:0,gold:1,silver:2,bronze:3};
+  const payload=Buffer.alloc(10);
+  payload[0]=2;payload.writeUInt32BE(Number(studentId),1);payload.writeUInt32BE(Number(examId),5);payload[9]=awards[award];
+  const body=payload.toString('base64url'), signed=`N38-${body}`;
+  const signature=createHmac('sha256',secret).update(signed).digest().subarray(0,16).toString('base64url');
+  return `${signed}.${signature}`;
 }
 function readCertificateProof(value, secret) {
   if (typeof value !== 'string' || value.length > 512) return null;
   const [body, signature, extra] = value.split('.');
   if (!body || !signature || extra) return null;
+  if (body.startsWith('N38-')) {
+    const signed=body, payloadText=body.slice(4);
+    const expected=createHmac('sha256',secret).update(signed).digest().subarray(0,16);
+    let actual;try{actual=Buffer.from(signature,'base64url')}catch{return null}
+    if(actual.length!==expected.length||!timingSafeEqual(actual,expected))return null;
+    try {
+      const bytes=Buffer.from(payloadText,'base64url');
+      if(bytes.length!==10||bytes.toString('base64url')!==payloadText||bytes[0]!==2)return null;
+      const awards=['participation','gold','silver','bronze'],award=awards[bytes[9]];
+      const student_id=bytes.readUInt32BE(1),exam_id=bytes.readUInt32BE(5);
+      if(!award||student_id<1||exam_id<1)return null;
+      return {v:2,student_id,exam_id,award};
+    }catch{return null}
+  }
+  // Continue verifying certificates already printed with the original v1 proof format.
   const expected = createHmac('sha256', secret).update(body).digest();
   const actual = Buffer.from(signature, 'base64url');
   if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
@@ -661,181 +680,4 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
         ]);
         if (!settings) throw Object.assign(new Error('missing_settings'), { status: 503 });
         return json({ settings, questions, exams, attempts, students_count: students.rows[0].count,
-          portal_armed: env.NAFIS_STUDENT_PORTAL_ENABLED === 'true' }, 200, headers);
-      }
-      if (request.method==='GET' && path==='/admin/certificates/students') {
-        const {rows}=await pool.query(`SELECT s.id,s.full_name,s.grade,s.section,
-          (a.student_id IS NOT NULL AND a.revoked_at IS NULL) AS access_enabled,a.issued_at
-          FROM public.nafis_students s LEFT JOIN public.naf038_student_access a ON a.student_id=s.id
-          ORDER BY s.grade,s.section,s.full_name LIMIT 2000`);
-        return json({students:rows.map(s=>({id:s.id,full_name:s.full_name,grade:gradeText(s.grade),section:s.section,
-          access_enabled:Boolean(s.access_enabled),issued_at:s.issued_at||null}))},200,headers);
-      }
-      const issueStudentCode=/^\/admin\/certificates\/students\/(\d+)\/access-code$/.exec(path);
-      if (issueStudentCode && request.method==='POST') {
-        const studentId=Number(issueStudentCode[1]);
-        if (!Number.isSafeInteger(studentId)||studentId<1) return fail(400,'invalid_student','سجل الطالبة غير صالح.');
-        const accessCode=randomBytes(24).toString('base64url');
-        const {rows}=await pool.query(`INSERT INTO public.naf038_student_access(student_id,access_hash,issued_by,issued_at,revoked_at)
-          SELECT id,$2,$3,NOW(),NULL FROM public.nafis_students WHERE id=$1
-          ON CONFLICT (student_id) DO UPDATE SET access_hash=EXCLUDED.access_hash,issued_by=EXCLUDED.issued_by,
-            issued_at=NOW(),revoked_at=NULL
-          RETURNING student_id`,[studentId,studentAccessHash(accessCode),admin.sub]);
-        if (!rows[0]) return fail(404,'student_not_found','سجل الطالبة غير موجود.');
-        return json({issued:true,access_code:accessCode},201,headers);
-      }
-      const revokeStudentCode=/^\/admin\/certificates\/students\/(\d+)\/access-code$/.exec(path);
-      if (revokeStudentCode && request.method==='DELETE') {
-        const {rows}=await pool.query(`UPDATE public.naf038_student_access SET revoked_at=NOW(),issued_by=$2
-          WHERE student_id=$1 AND revoked_at IS NULL RETURNING student_id`,[Number(revokeStudentCode[1]),admin.sub]);
-        return rows[0]?json({revoked:true},200,headers):fail(404,'student_access_not_found','لا يوجد رمز نشط لهذا السجل.');
-      }
-      if (request.method === 'GET' && path === '/admin/documentation') {
-        try {
-          const [current, history] = await Promise.all([
-            pool.query(`SELECT version_id,created_at,actor_email,action,change_summary,restored_from,document
-              FROM public.naf038_document_versions ORDER BY version_id DESC LIMIT 1`),
-            pool.query(`SELECT version_id,created_at,actor_email,action,change_summary,restored_from
-              FROM public.naf038_document_versions ORDER BY version_id DESC`),
-          ]);
-          return json({ current: current.rows[0] || null, versions: history.rows }, 200, headers);
-        } catch (error) {
-          if (error?.code === '42P01') return fail(503, 'documentation_migration_required', 'مركز التوثيق غير مهيأ في قاعدة Preview بعد.');
-          throw error;
-        }
-      }
-      if (request.method === 'POST' && path === '/admin/documentation') {
-        const body = await bodyJson(request);
-        const summary = trim(body.change_summary, 500);
-        if (!summary || !validateDocumentation(body.document))
-          return fail(400, 'invalid_documentation', 'راجعي حقول الوثيقة والمرفقات قبل الحفظ.');
-        try {
-          const { rows } = await pool.query(`INSERT INTO public.naf038_document_versions
-            (actor_email,action,change_summary,document)
-            VALUES ($1,$2,$3,$4::jsonb)
-            RETURNING version_id,created_at,actor_email,action,change_summary,document`,
-          [admin.sub, body.action === 'create' ? 'create' : 'update', summary, JSON.stringify(body.document)]);
-          return json({ saved: true, current: rows[0] }, 201, headers);
-        } catch (error) {
-          if (error?.code === '42P01') return fail(503, 'documentation_migration_required', 'مركز التوثيق غير مهيأ في قاعدة Preview بعد.');
-          throw error;
-        }
-      }
-      const restoreDocumentation = /^\/admin\/documentation\/versions\/(\d+)\/restore$/.exec(path);
-      if (restoreDocumentation && request.method === 'POST') {
-        const body = await bodyJson(request);
-        const summary = trim(body.change_summary, 500);
-        if (!summary) return fail(400, 'invalid_documentation', 'اكتبي سبب استعادة الإصدار.');
-        try {
-          const { rows } = await pool.query(`INSERT INTO public.naf038_document_versions
-            (actor_email,action,change_summary,restored_from,document)
-            SELECT $1,'restore',$2,version_id,document FROM public.naf038_document_versions
-             WHERE version_id=$3 RETURNING version_id,created_at,actor_email,action,change_summary,restored_from,document`,
-          [admin.sub, summary, restoreDocumentation[1]]);
-          return rows[0] ? json({ restored: true, current: rows[0] }, 201, headers) : fail(404, 'version_not_found', 'الإصدار المطلوب غير موجود.');
-        } catch (error) {
-          if (error?.code === '42P01') return fail(503, 'documentation_migration_required', 'مركز التوثيق غير مهيأ في قاعدة Preview بعد.');
-          throw error;
-        }
-      }
-      if (request.method === 'POST' && path === '/admin/password') {
-        const body = await bodyJson(request);
-        const currentPassword = String(body.current_password || '');
-        const newPassword = String(body.new_password || '');
-        if (newPassword.length < 14) return fail(400, 'weak_password', 'اختاري كلمة مرور من 14 محرفًا على الأقل.');
-        const passwordHash = await activeAdminPasswordHash(pool, env.NAFIS_ADMIN_PASSWORD_HASH);
-        if (!await verifyPassword(currentPassword, passwordHash))
-          return fail(401, 'current_password_invalid', 'كلمة المرور الحالية غير صحيحة.');
-        const nextHash = await encodePassword(newPassword);
-        try {
-          await pool.query(`INSERT INTO public.naf038_admin_credentials(id,password_hash,updated_at)
-            VALUES (1,$1,NOW()) ON CONFLICT (id) DO UPDATE SET password_hash=EXCLUDED.password_hash,updated_at=NOW()`, [nextHash]);
-        } catch (error) {
-          if (error?.code === '42P01') return fail(503, 'password_change_unavailable', 'طبّقي ترحيل نافس على Neon أولًا ثم أعيدي المحاولة.');
-          throw error;
-        }
-        return json({ changed: true }, 200, headers);
-      }
-      if (request.method === 'POST' && path === '/admin/questions') {
-        const result = await addQuestions(pool, (await bodyJson(request)).questions);
-        return json(result, 201, headers);
-      }
-      const deleteQuestion = /^\/admin\/questions\/(\d+)$/.exec(path);
-      if (deleteQuestion && request.method === 'DELETE') {
-        const { rowCount } = await pool.query('DELETE FROM public.naf038_questions WHERE id=$1', [deleteQuestion[1]]);
-        return rowCount ? json({ ok: true }, 200, headers) : fail(404, 'question_not_found', 'السؤال غير موجود.');
-      }
-      const examMatch = /^\/admin\/exams\/(\d+)$/.exec(path);
-      if (examMatch && request.method === 'PATCH') {
-        const body = await bodyJson(request);
-        if (typeof body.published !== 'boolean') return fail(400, 'invalid_exam', 'حالة الاختبار غير صالحة.');
-        if (body.published) {
-          const { rows } = await pool.query('SELECT COUNT(*)::integer AS n FROM public.naf038_questions WHERE exam_id=$1', [examMatch[1]]);
-          if (!rows[0].n) return fail(409, 'exam_empty', 'أضيفي الأسئلة قبل نشر الاختبار.');
-        }
-        const result = await pool.query('UPDATE public.naf038_exams SET is_published=$2 WHERE id=$1 RETURNING id,is_published', [examMatch[1], body.published]);
-        return result.rows[0] ? json({ ok: true, ...result.rows[0] }, 200, headers) : fail(404, 'exam_not_found', 'الاختبار غير موجود.');
-      }
-      if (request.method === 'PATCH' && path === '/admin/settings') {
-        const b = await bodyJson(request);
-        const monday = weekDate(b.current_week);
-        const minutes = Number(b.exam_minutes);
-        if (!monday || !Number.isInteger(minutes) || minutes < 5 || minutes > 180 || typeof b.students_enabled !== 'boolean')
-          return fail(400, 'invalid_settings', 'تحققي من الأسبوع والمدة.');
-        if (b.students_enabled && env.NAFIS_STUDENT_PORTAL_ENABLED !== 'true')
-          return fail(423, 'students_closed', 'لا يمكن فتح البوابة قبل تفعيل بوابة Neon بعد اكتمال المراجعة.');
-        const { rows } = await pool.query(`UPDATE public.naf038_settings SET current_week=$1, exam_minutes=$2, students_enabled=$3, updated_at=NOW() WHERE id=1 RETURNING id,current_week,exam_minutes,students_enabled`, [b.current_week, minutes, b.students_enabled]);
-        return rows[0] ? json(rows[0], 200, headers) : fail(503, 'settings_missing', 'إعدادات المنصة غير موجودة.');
-      }
-      return fail(404, 'not_found', 'المسار غير موجود.');
-    }
-    if (request.method === 'GET' && path === '/student/exams') {
-      if (env.NAFIS_STUDENT_PORTAL_ENABLED !== 'true') return fail(423, 'students_closed', 'المنصة مغلقة حاليًا.');
-      const grade = Number(url.searchParams.get('grade')), subject = trim(url.searchParams.get('subject'), 40);
-      if (!GRADES.has(grade) || !SUBJECTS.has(subject)) return fail(400, 'invalid_exam', 'اختاري الصف والمادة.');
-      const current = await currentExam(pool, grade, subject);
-      if (current.error === 'closed' || !current.exam) return fail(404, 'exam_unavailable', 'لا يوجد اختبار منشور لهذا الاختيار.');
-      const questions = await examQuestions(pool, current.exam.id, false);
-      return json({ exam: { id: current.exam.id, duration_minutes: current.exam.duration_minutes, questions: questions.map(publicQuestion) } }, 200, headers);
-    }
-    if (request.method === 'POST' && path === '/student/start') {
-      if (env.NAFIS_STUDENT_PORTAL_ENABLED !== 'true') return fail(423, 'students_closed', 'المنصة مغلقة حاليًا.');
-      if (!env.NAFIS_SESSION_SECRET) return fail(503, 'not_configured', 'لم يكتمل إعداد الحماية.');
-      const result = await studentStart(pool, await bodyJson(request), env);
-      return json(result, 200, headers);
-    }
-    if (request.method === 'POST' && path === '/student/submit') {
-      if (env.NAFIS_STUDENT_PORTAL_ENABLED !== 'true') return fail(423, 'students_closed', 'المنصة مغلقة حاليًا.');
-      const token = authExam(request, env);
-      if (!token) return fail(401, 'exam_session_invalid', 'انتهت جلسة الاختبار.');
-      const result = await studentSubmit(pool, await bodyJson(request), token);
-      return json(result, 201, {...headers,'set-cookie':studentSessionCookie(token.studentId,token.examId,request,env.NAFIS_SESSION_SECRET,now())});
-    }
-    if (request.method === 'PUT' && path === '/student/draft') {
-      if (env.NAFIS_STUDENT_PORTAL_ENABLED !== 'true') return fail(423, 'students_closed', 'المنصة مغلقة حاليًا.');
-      const token = authExam(request, env);
-      if (!token) return fail(401, 'exam_session_invalid', 'انتهت جلسة الاختبار.');
-      return json(await studentSaveDraft(pool, await bodyJson(request), token), 200, headers);
-    }
-    return fail(404, 'not_found', 'المسار غير موجود.');
-  } catch (error) {
-    const status = Number(error?.status) || 500;
-    const known = new Map([
-      ['invalid_student', [400, 'بيانات الطالبة غير مكتملة.']], ['students_closed', [423, 'المنصة مغلقة حاليًا.']],
-      ['announcement_window_closed', [423, 'انتهى وقت الاختبار لهذا الأسبوع وسيُعلن عن النتائج الآن.']],
-      ['exam_unavailable', [404, 'لا يوجد اختبار منشور لهذا الاختيار.']], ['exam_empty', [404, 'الاختبار غير جاهز.']],
-      ['attempt_used', [409, 'سبق تسجيل محاولة لهذا الاختبار.']], ['invalid_submission', [400, 'تعذر التحقق من الإجابات.']],
-      ['time_expired', [409, 'انتهى وقت الاختبار.']], ['exam_changed', [409, 'تغير الاختبار؛ ابدئي محاولة جديدة.']],
-      ['invalid_week', [400, 'صيغة الأسبوع غير صحيحة.']], ['invalid_exam', [400, 'بيانات الاختبار غير صحيحة.']],
-      ['invalid_questions', [400, 'عدد الأسئلة غير صالح.']], ['invalid_question', [400, 'راجعي نص السؤال والخيارات والإجابة الصحيحة.']],
-      ['missing_settings', [503, 'إعدادات المنصة غير موجودة.']], ['invalid_json', [400, 'بيانات الطلب غير صالحة.']],
-      ['too_large', [413, 'حجم البيانات أكبر من الحد المسموح.']],
-    ]);
-    const detail = known.get(error?.message);
-    if (detail) return fail(detail[0], error.message, detail[1]);
-    console.error('nafis_api_error', { name: error?.name || 'Error', code: error?.code || 'unknown' });
-    return fail(status, 'server_error', 'تعذر إكمال الطلب الآن.');
-  }
-}
-
-export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb };
+          portal_armed: env.NAF
