@@ -1,5 +1,6 @@
 -- Official documentation center and append-only approval history.
 -- Apply only to the verified isolated Preview Neon database.
+BEGIN;
 CREATE TABLE IF NOT EXISTS public.naf038_document_versions (
   version_id bigserial PRIMARY KEY,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -31,3 +32,4 @@ CREATE POLICY naf038_document_versions_backend ON public.naf038_document_version
 GRANT SELECT, INSERT ON public.naf038_document_versions TO CURRENT_USER;
 GRANT USAGE, SELECT ON SEQUENCE public.naf038_document_versions_version_id_seq TO CURRENT_USER;
 REVOKE UPDATE, DELETE, TRUNCATE ON public.naf038_document_versions FROM PUBLIC;
+COMMIT;
