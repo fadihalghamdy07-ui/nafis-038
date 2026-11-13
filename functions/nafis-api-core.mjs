@@ -504,17 +504,7 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
       const correctEmail = safeEqualText(email, (env.NAFIS_ADMIN_EMAIL || '').toLowerCase());
       const passwordHash = await activeAdminPasswordHash(pool, env.NAFIS_ADMIN_PASSWORD_HASH);
       const correctPassword = await verifyPassword(String(body.password || ''), passwordHash);
-      if (!correctEmail || !correctPassword || !env.NAFIS_SESSION_SECRET) {
-        // Temporary, Preview-only diagnosis. Never log identity, IP, credential material, or hashes.
-        if (env.VERCEL_ENV === 'preview') {
-          const failedConditions = [];
-          if (!correctEmail) failedConditions.push('email_mismatch');
-          if (!correctPassword) failedConditions.push('password_mismatch');
-          if (!env.NAFIS_SESSION_SECRET) failedConditions.push('session_secret_missing');
-          console.warn(JSON.stringify({ event: 'nafis_admin_auth_rejected', failed_conditions: failedConditions }));
-        }
-        return fail(401, 'invalid_login', 'بيانات الدخول غير صحيحة.');
-      }
+      if (!correctEmail || !correctPassword || !env.NAFIS_SESSION_SECRET) return fail(401, 'invalid_login', 'بيانات الدخول غير صحيحة.');
       const issued = Math.floor(now() / 1000), exp = issued + 8 * 60 * 60;
       const token = signedToken({ sub: email, role: 'admin', iat: issued, exp }, env.NAFIS_SESSION_SECRET);
       return json({ token, expires_at: exp, email }, 200, headers);

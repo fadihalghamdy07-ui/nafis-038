@@ -83,24 +83,6 @@ test('login issues an eight-hour token after checking the server-side scrypt has
   assert.equal(result.expires_at, 1_800_028_800);
 });
 
-test('temporary Preview login diagnostics log only failed condition codes', async () => {
-  const logs = [];
-  const originalWarn = console.warn;
-  console.warn = value => logs.push(String(value));
-  try {
-    const response = await handleRequest(request('/auth/login', {
-      method:'POST', body:{ email:'private-admin@example.org', password:'private-password-value' },
-    }), { env:{...env, VERCEL_ENV:'preview', NAFIS_ADMIN_PASSWORD_HASH:'invalid-hash' }, pool:null });
-    assert.equal(response.status, 401);
-  } finally {
-    console.warn = originalWarn;
-  }
-  assert.equal(logs.length, 1);
-  const entry = JSON.parse(logs[0]);
-  assert.deepEqual(entry, { event:'nafis_admin_auth_rejected', failed_conditions:['email_mismatch','password_mismatch'] });
-  assert.doesNotMatch(logs[0], /private-admin|private-password|invalid-hash/);
-});
-
 test('admin changes password after reauthentication and the stored hash supersedes the environment hash', async () => {
   const salt = randomBytes(16), currentPassword = 'current-test-password-long';
   const digest = await scrypt(currentPassword, salt, 64);
