@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import {
   readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest,
-  authAdmin, ADMIN_SESSION_TTL_SECONDS,
+  authAdmin, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash,
 } from '../functions/nafis-api-core.mjs';
 
 const secret = 'test-only-session-secret';
@@ -69,4 +69,15 @@ test('mutations accept only same-origin requests for CSRF defense', () => {
     method: 'PATCH', headers: { origin: 'https://attacker.example' },
   })), false);
   assert.equal(sameOriginRequest(new Request('https://preview.example/api/admin/settings', { method: 'PATCH' })), false);
+});
+
+test('password update and login verification share the same scrypt format', async () => {
+  const hash = await encodePassword('fake-isolated-test-password');
+  assert.match(hash, /^scrypt\\$/);
+  assert.equal(await verifyPassword('fake-isolated-test-password', hash), true);
+  assert.equal(await verifyPassword('different-test-password', hash), false);
+  const dbPool = { query: async () => ({ rows: [{ password_hash: hash }] }) };
+  assert.equal(await activeAdminPasswordHash(dbPool, 'environment-fallback'), hash);
+  const emptyPool = { query: async () => ({ rows: [] }) };
+  assert.equal(await activeAdminPasswordHash(emptyPool, 'environment-fallback'), 'environment-fallback');
 });
