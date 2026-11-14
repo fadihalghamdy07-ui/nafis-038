@@ -26,7 +26,9 @@ test('signed token is accepted before expiry and rejected at expiry', () => {
 
 test('tampered token is rejected', () => {
   const token = makeToken(100);
-  assert.equal(readToken(token, secret, 99_000), null);
+  const [body, signature] = token.split('.');
+  const altered = body + '.' + (signature[0] === 'A' ? 'B' : 'A') + signature.slice(1);
+  assert.equal(readToken(altered, secret, 99_000), null);
 });
 
 test('admin cookie uses HttpOnly Secure SameSite Strict attributes', () => {
