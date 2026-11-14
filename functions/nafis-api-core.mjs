@@ -924,4 +924,4 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
   }
 }
 
-export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb, readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest, authAdmin, hasCurrentCredentialVersion, adminOnly, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash, withPreviewTestSavepoint };
+export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb, readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest, authAdmin, hasCurrentCredentialVersion, adminOnly, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash };
