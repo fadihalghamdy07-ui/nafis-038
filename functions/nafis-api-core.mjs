@@ -93,6 +93,10 @@ function authAdmin(request, env) {
   const payload = secret ? readToken(token, secret) : null;
   return payload?.role === 'admin' && payload.sub === (env.NAFIS_ADMIN_EMAIL || '').trim().toLowerCase() ? payload : null;
 }
+function hasCurrentCredentialVersion(payload, updatedAt) {
+  const version = new Date(updatedAt).getTime();
+  return Number.isSafeInteger(Number(payload?.cv)) && Number(payload.cv) === version;
+}
 function adminSessionCookie(token) {
   return `__Host-naf038_admin_session=${token}; Path=/; Max-Age=${ADMIN_SESSION_TTL_SECONDS}; HttpOnly; Secure; SameSite=Strict`;
 }
@@ -189,12 +193,27 @@ function corsHeaders(request, env) {
     vary: 'Origin',
   };
 }
-function adminOnly(request, env) {
+async function adminOnly(request, env, pool) {
   const admin = authAdmin(request, env);
   if (!admin) return fail(401, 'admin_login_required', 'يلزم تسجيل دخول الإدارة.');
   if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && !sameOriginRequest(request))
     return fail(403, 'csrf_origin_rejected', 'تعذر التحقق من مصدر الطلب.');
-  return admin;
+  try {
+    const { rows } = await pool.query('SELECT updated_at FROM public.naf038_admin_credentials WHERE id=1 LIMIT 1');
+    if (!rows[0]) return fail(503, 'admin_session_revocation_unavailable', 'تعذر التحقق من صلاحية الجلسة.');
+    if (!hasCurrentCredentialVersion(admin, rows[0].updated_at))
+      return fail(401, 'admin_session_revoked', 'انتهت صلاحية جلسة الإدارة. سجّلي الدخول مجددًا.');
+    return admin;
+  } catch {
+    return fail(503, 'admin_session_revocation_unavailable', 'تعذر التحقق من صلاحية الجلسة.');
+  }
+}
+async function bumpAdminCredentialVersion(pool) {
+  const { rows } = await pool.query(`UPDATE public.naf038_admin_credentials
+    SET updated_at=GREATEST(clock_timestamp(),updated_at + interval '1 millisecond')
+    WHERE id=1 RETURNING updated_at`);
+  if (!rows[0]) throw Object.assign(new Error('admin_session_revocation_unavailable'), { status: 503 });
+  return new Date(rows[0].updated_at).getTime();
 }
 
 function validateDocumentation(value) {
@@ -651,12 +670,16 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
         console.info('naf038_admin_login_denied', { reason });
         return fail(401, 'invalid_login', 'بيانات الدخول غير صحيحة.');
       }
+      const credentialRows = await pool.query('SELECT updated_at FROM public.naf038_admin_credentials WHERE id=1 LIMIT 1');
+      if (!credentialRows.rows[0]) return fail(503, 'admin_session_revocation_unavailable', 'تعذر إعداد جلسة قابلة للإبطال.');
       const issued = Math.floor(now() / 1000), exp = issued + ADMIN_SESSION_TTL_SECONDS;
-      const token = signedToken({ sub: email, role: 'admin', iat: issued, exp }, env.NAFIS_SESSION_SECRET);
+      const cv = new Date(credentialRows.rows[0].updated_at).getTime();
+      const token = signedToken({ sub: email, role: 'admin', iat: issued, exp, cv }, env.NAFIS_SESSION_SECRET);
       return json({ expires_at: exp, email }, 200, { ...headers, 'set-cookie': adminSessionCookie(token) });
     }
     if (request.method === 'POST' && path === '/auth/logout') {
-      if (!sameOriginRequest(request)) return fail(403, 'csrf_origin_rejected', 'تعذر التحقق من مصدر الطلب.');
+      const admin = await adminOnly(request, env, pool); if (admin instanceof Response) return admin;
+      await bumpAdminCredentialVersion(pool);
       return json({ ok: true }, 200, { ...headers, 'set-cookie': clearAdminSessionCookie() });
     }
     if (request.method === 'POST' && path === '/student/achievements/session') {
@@ -698,12 +721,12 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
       return json({valid:certificates.some(item=>item.type===proof.award&&item.verification_code===verifyCertificate[1])},200,headers);
     }
     if (request.method === 'GET' && path === '/admin/health') {
-      const admin = adminOnly(request, env); if (admin instanceof Response) return json({ error: 'admin_login_required' }, 401, headers);
+      const admin = await adminOnly(request, env, pool); if (admin instanceof Response) return admin;
       const checks = await validateDb(pool);
       return json({ ready: checks.every(x => x.ready), checks }, 200, headers);
     }
     if (path.startsWith('/admin/')) {
-      const admin = adminOnly(request, env); if (admin instanceof Response) return json({ error: 'admin_login_required' }, 401, headers);
+      const admin = await adminOnly(request, env, pool); if (admin instanceof Response) return admin;
       if (request.method === 'GET' && path === '/admin/bootstrap') {
         const [settings, questions, exams, attempts, students] = await Promise.all([
           readSettings(pool), collectQuestions(pool), collectExams(pool), collectAttempts(pool),
@@ -788,6 +811,13 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
           throw error;
         }
       }
+      if (request.method === 'POST' && path === '/admin/sessions/revoke-others') {
+        const cv = await bumpAdminCredentialVersion(pool);
+        const issued = Math.floor(now() / 1000);
+        const exp = Math.min(Number(admin.exp), issued + ADMIN_SESSION_TTL_SECONDS);
+        const token = signedToken({ sub: admin.sub, role: 'admin', iat: issued, exp, cv }, env.NAFIS_SESSION_SECRET);
+        return json({ revoked: true, expires_at: exp }, 200, { ...headers, 'set-cookie': adminSessionCookie(token) });
+      }
       if (request.method === 'POST' && path === '/admin/password') {
         const body = await bodyJson(request);
         const currentPassword = String(body.current_password || '');
@@ -799,7 +829,8 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
         const nextHash = await encodePassword(newPassword);
         try {
           await pool.query(`INSERT INTO public.naf038_admin_credentials(id,password_hash,updated_at)
-            VALUES (1,$1,NOW()) ON CONFLICT (id) DO UPDATE SET password_hash=EXCLUDED.password_hash,updated_at=NOW()`, [nextHash]);
+            VALUES (1,$1,clock_timestamp()) ON CONFLICT (id) DO UPDATE SET password_hash=EXCLUDED.password_hash,
+            updated_at=GREATEST(clock_timestamp(),naf038_admin_credentials.updated_at + interval '1 millisecond')`, [nextHash]);
         } catch (error) {
           if (error?.code === '42P01') return fail(503, 'password_change_unavailable', 'طبّقي ترحيل نافس على Neon أولًا ثم أعيدي المحاولة.');
           throw error;
@@ -888,4 +919,4 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
   }
 }
 
-export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb, readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest, authAdmin, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash };
+export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb, readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest, authAdmin, hasCurrentCredentialVersion, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash };
