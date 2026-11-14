@@ -755,7 +755,7 @@ async function previewTestCleanup(pool,env,body) {
   if(!(await previewTestIdentity(pool,env)))return {status:403,body:{error:'preview_isolation_not_verified'}};
   const runId=String(body.run_id||''),week=String(body.certificate_week||''),activeWeek=String(body.active_week||'');
   if(!/^[a-f0-9]{12}$/.test(runId)||!/^2026-W(?:0[1-9]|[1-3][0-9]|4[0-5])$/.test(week)||!/^\d{4}-W\d{2}$/.test(activeWeek))return {status:400,body:{error:'invalid_test_cleanup_scope'}};
-  let client,transaction=false;
+  let client,transaction=false,verifyCounts=null;
   try{
     client=await pool.connect();await client.query('BEGIN');transaction=true;
     await client.query('SELECT pg_advisory_xact_lock(38038,20261114)');
@@ -777,11 +777,12 @@ async function previewTestCleanup(pool,env,body) {
     await client.query('DELETE FROM public.naf038_results_publications WHERE week_key=$1 AND published_at=$2::timestamptz',[week,scheduled]);
     const verify=await client.query("SELECT (SELECT COUNT(*)::int FROM public.nafis_students WHERE full_name LIKE $1) AS students,(SELECT COUNT(*)::int FROM public.naf038_exams WHERE id=ANY($3::int[])) AS exams,(SELECT COUNT(*)::int FROM public.naf038_questions q WHERE q.exam_id=ANY($3::int[])) AS questions,(SELECT COUNT(*)::int FROM public.naf038_attempts WHERE student_id=ANY($2::int[]) OR exam_id=ANY($3::int[])) AS attempts,(SELECT COUNT(*)::int FROM public.naf038_drafts WHERE student_id=ANY($2::int[]) OR exam_id=ANY($3::int[])) AS drafts,(SELECT COUNT(*)::int FROM public.naf038_student_access WHERE student_id=ANY($2::int[])) AS accesses,(SELECT COUNT(*)::int FROM public.naf038_results_publications WHERE week_key=$4 AND published_at=$5::timestamptz) AS publications,(SELECT COUNT(*)::int FROM public.nafis_students) AS all_students,(SELECT COUNT(*)::int FROM public.naf038_exams) AS all_exams,(SELECT COUNT(*)::int FROM public.naf038_questions) AS all_questions,(SELECT COUNT(*)::int FROM public.naf038_attempts) AS all_attempts,(SELECT COUNT(*)::int FROM public.naf038_drafts) AS all_drafts,(SELECT COUNT(*)::int FROM public.naf038_student_access) AS all_accesses",[prefix,fakeIds,examIds,week,scheduled]);
     const v=verify.rows[0]||{};
+    verifyCounts=Object.fromEntries(Object.entries(v).map(([k,n])=>[k,Number(n)||0]));
     if(Object.values(v).some(n=>Number(n)!==0))throw Object.assign(new Error('cleanup_verification_failed'),{testStage:'cleanup_verify'});
     await client.query('COMMIT');transaction=false;
     return {status:200,body:{cleaned:true,verified_empty:true,removed_students:fakeIds.length,removed_exams:examIds.length},setCookie:'naf038_student_session=; Path=/api; Max-Age=0; HttpOnly; Secure; SameSite=Strict'};
   }catch(error){if(transaction&&client){try{await client.query('ROLLBACK');}catch{}}
-    return {status:Number(error?.httpStatus)||500,body:{error:'preview_test_cleanup_failed',stage:error?.testStage||'cleanup'}};
+    return {status:Number(error?.httpStatus)||500,body:{error:'preview_test_cleanup_failed',stage:error?.testStage||'cleanup',...(verifyCounts?{counts:verifyCounts}:{})}};
   }finally{if(client)client.release();}
 }
 
