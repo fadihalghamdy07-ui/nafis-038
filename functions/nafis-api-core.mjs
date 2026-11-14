@@ -759,7 +759,9 @@ async function previewTestCleanup(pool,env,body) {
   try{
     client=await pool.connect();await client.query('BEGIN');transaction=true;
     await client.query('SELECT pg_advisory_xact_lock(38038,20261114)');
-    const prefix='N38TEST-'+runId+'-%';
+    // Student names include a descriptive prefix before the synthetic marker;
+    // keep the unique run marker as the exact cleanup scope anywhere in the name.
+    const prefix='%N38TEST-'+runId+'-%';
     const students=await client.query('SELECT id FROM public.nafis_students WHERE full_name LIKE $1',[prefix]);
     const fakeIds=students.rows.map(r=>Number(r.id));
     if(fakeIds.length!==4)throw Object.assign(new Error('test_fixture_scope_mismatch'),{httpStatus:409,testStage:'cleanup_scope'});
