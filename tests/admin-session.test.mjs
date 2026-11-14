@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import {
   readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest,
-  authAdmin, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash,
+  authAdmin, adminOnly, handleRequest, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash,
 } from '../functions/nafis-api-core.mjs';
 
 const secret = 'test-only-session-secret';
 const email = 'preview-admin@example.invalid';
-function makeToken(exp) {
-  const body = Buffer.from(JSON.stringify({ sub: email, role: 'admin', iat: 1, exp })).toString('base64url');
+function makeToken(exp, cv = Date.now()) {
+  const body = Buffer.from(JSON.stringify({ sub: email, role: 'admin', iat: 1, exp, cv })).toString('base64url');
   const signature = createHmac('sha256', secret).update(body).digest('base64url');
   return body + '.' + signature;
 }
@@ -53,10 +53,10 @@ test('logout clears the session cookie', () => {
 test('admin authorization accepts cookies and rejects bearer-only tokens', () => {
   const token = makeToken(Math.floor(Date.now() / 1000) + 3600);
   const env = { NAFIS_SESSION_SECRET: secret, NAFIS_ADMIN_EMAIL: email };
-  const cookieRequest = new Request('https://preview.example/api/admin/bootstrap', {
+  const cookieRequest = new Request('https://preview.example/admin/bootstrap', {
     headers: { cookie: '__Host-naf038_admin_session=' + token },
   });
-  const bearerRequest = new Request('https://preview.example/api/admin/bootstrap', {
+  const bearerRequest = new Request('https://preview.example/admin/bootstrap', {
     headers: { authorization: 'Bearer ' + token },
   });
   assert.equal(authAdmin(cookieRequest, env)?.sub, email);
@@ -64,13 +64,13 @@ test('admin authorization accepts cookies and rejects bearer-only tokens', () =>
 });
 
 test('mutations accept only same-origin requests for CSRF defense', () => {
-  assert.equal(sameOriginRequest(new Request('https://preview.example/api/admin/settings', {
+  assert.equal(sameOriginRequest(new Request('https://preview.example/admin/settings', {
     method: 'PATCH', headers: { origin: 'https://preview.example' },
   })), true);
-  assert.equal(sameOriginRequest(new Request('https://preview.example/api/admin/settings', {
+  assert.equal(sameOriginRequest(new Request('https://preview.example/admin/settings', {
     method: 'PATCH', headers: { origin: 'https://attacker.example' },
   })), false);
-  assert.equal(sameOriginRequest(new Request('https://preview.example/api/admin/settings', { method: 'PATCH' })), false);
+  assert.equal(sameOriginRequest(new Request('https://preview.example/admin/settings', { method: 'PATCH' })), false);
 });
 
 test('password update and login verification share the same scrypt format and database source', async () => {
@@ -82,4 +82,92 @@ test('password update and login verification share the same scrypt format and da
   assert.equal(await activeAdminPasswordHash(dbPool, 'environment-fallback'), hash);
   const emptyPool = { query: async () => ({ rows: [] }) };
   assert.equal(await activeAdminPasswordHash(emptyPool, 'environment-fallback'), 'environment-fallback');
+});
+
+
+
+
+function revocationPool(initialVersion) {
+  const state = { version: initialVersion };
+  return {
+    state,
+    async query(sql) {
+      if (sql.startsWith('SELECT updated_at FROM public.naf038_admin_credentials')) {
+        return { rows: [{ updated_at: new Date(state.version).toISOString() }] };
+      }
+      if (sql.startsWith('UPDATE public.naf038_admin_credentials')) {
+        state.version += 2;
+        return { rows: [{ updated_at: new Date(state.version).toISOString() }], rowCount: 1 };
+      }
+      throw new Error('Unexpected query in focused session test');
+    },
+  };
+}
+function adminEnv() {
+  return { NAFIS_SESSION_SECRET: secret, NAFIS_ADMIN_EMAIL: email };
+}
+function cookieToken(response) {
+  const value = response.headers.get('set-cookie') || '';
+  return value.match(/__Host-naf038_admin_session=([^;]*)/)?.[1] || '';
+}
+
+test('revoke-others rotates the server version and keeps only the returned session valid', async () => {
+  const initialVersion = Date.now() - 10000;
+  const oldToken = makeToken(Math.floor(Date.now() / 1000) + 3600, initialVersion);
+  const pool = revocationPool(initialVersion);
+  const response = await handleRequest(new Request('https://preview.example/admin/sessions/revoke-others', {
+    method: 'POST',
+    headers: {
+      origin: 'https://preview.example',
+      cookie: '__Host-naf038_admin_session=' + oldToken,
+      'content-type': 'application/json',
+    },
+  }), { pool, env: adminEnv() });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).revoked, true);
+  const replacement = cookieToken(response);
+  assert.ok(replacement);
+  const current = authAdmin(new Request('https://preview.example/admin/bootstrap', {
+    headers: { cookie: '__Host-naf038_admin_session=' + replacement },
+  }), adminEnv());
+  assert.ok(current);
+  assert.equal(current.cv, pool.state.version);
+  const oldResponse = await handleRequest(new Request('https://preview.example/admin/bootstrap', {
+    headers: { cookie: '__Host-naf038_admin_session=' + oldToken },
+  }), { pool, env: adminEnv() });
+  assert.equal(oldResponse.status, 401);
+  assert.equal((await oldResponse.json()).error, 'admin_session_revoked');
+});
+
+test('logout revokes the signed unexpired session on the server and clears its cookie', async () => {
+  const initialVersion = Date.now() - 10000;
+  const token = makeToken(Math.floor(Date.now() / 1000) + 3600, initialVersion);
+  const pool = revocationPool(initialVersion);
+  const response = await handleRequest(new Request('https://preview.example/auth/logout', {
+    method: 'POST',
+    headers: {
+      origin: 'https://preview.example',
+      cookie: '__Host-naf038_admin_session=' + token,
+    },
+  }), { pool, env: adminEnv() });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('set-cookie') || '', /Max-Age=0/);
+  const denied = await handleRequest(new Request('https://preview.example/admin/bootstrap', {
+    headers: { cookie: '__Host-naf038_admin_session=' + token },
+  }), { pool, env: adminEnv() });
+  assert.equal(denied.status, 401);
+  assert.equal((await denied.json()).error, 'admin_session_revoked');
+});
+
+test('revocation fails closed when the credential version cannot be read', async () => {
+  const token = makeToken(Math.floor(Date.now() / 1000) + 3600);
+  const request = new Request('https://preview.example/admin/bootstrap', {
+    headers: { cookie: '__Host-naf038_admin_session=' + token },
+  });
+  const result = await adminOnly(request, adminEnv(), {
+    query: async () => { throw new Error('database unavailable'); },
+  });
+  assert.ok(result instanceof Response);
+  assert.equal(result.status, 503);
+  assert.equal((await result.json()).error, 'admin_session_revocation_unavailable');
 });

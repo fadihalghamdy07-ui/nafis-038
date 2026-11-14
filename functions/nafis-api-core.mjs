@@ -670,7 +670,12 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
         console.info('naf038_admin_login_denied', { reason });
         return fail(401, 'invalid_login', 'بيانات الدخول غير صحيحة.');
       }
-      const credentialRows = await pool.query('SELECT updated_at FROM public.naf038_admin_credentials WHERE id=1 LIMIT 1');
+      let credentialRows;
+      try {
+        credentialRows = await pool.query('SELECT updated_at FROM public.naf038_admin_credentials WHERE id=1 LIMIT 1');
+      } catch {
+        return fail(503, 'admin_session_revocation_unavailable', 'تعذر إعداد جلسة قابلة للإبطال.');
+      }
       if (!credentialRows.rows[0]) return fail(503, 'admin_session_revocation_unavailable', 'تعذر إعداد جلسة قابلة للإبطال.');
       const issued = Math.floor(now() / 1000), exp = issued + ADMIN_SESSION_TTL_SECONDS;
       const cv = new Date(credentialRows.rows[0].updated_at).getTime();
@@ -919,4 +924,4 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
   }
 }
 
-export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb, readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest, authAdmin, hasCurrentCredentialVersion, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash };
+export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb, readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest, authAdmin, hasCurrentCredentialVersion, adminOnly, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash };
