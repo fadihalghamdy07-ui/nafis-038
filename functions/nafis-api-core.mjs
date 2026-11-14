@@ -771,6 +771,7 @@ async function previewTestCleanup(pool,env,body) {
     await client.query('DELETE FROM public.naf038_drafts WHERE student_id=ANY($1::int[]) OR exam_id=ANY($2::int[])',[fakeIds,examIds]);
     await client.query('DELETE FROM public.naf038_attempts WHERE student_id=ANY($1::int[]) OR exam_id=ANY($2::int[])',[fakeIds,examIds]);
     await client.query('DELETE FROM public.naf038_student_access WHERE student_id=ANY($1::int[])',[fakeIds]);
+    await client.query('DELETE FROM public.nafis_students WHERE id=ANY($1::int[])',[fakeIds]);
     await client.query('DELETE FROM public.naf038_questions WHERE exam_id=ANY($1::int[])',[examIds]);
     await client.query('DELETE FROM public.naf038_exams WHERE id=ANY($1::int[])',[examIds]);
     const scheduled=new Date(announcementAt(week)).toISOString();
