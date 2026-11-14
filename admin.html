@@ -13,7 +13,7 @@
 </main>
 <script src="api-config.js" onerror="window.__NO_NAFIS_CONFIG__=true"></script>
 <script>
-let previewTestScope = {run_id:'79af186629cf',certificate_week:'2026-W01',active_week:'2026-W46',summary:'نطاق بيانات الاختبار الوهمية المستعادة لتنظيفها والتحقق منها.'};
+let previewTestScope = {run_id:'f7b880d31f03',certificate_week:'2026-W01',active_week:'2026-W46',summary:'نطاق بيانات الاختبار الوهمية المستعادة لتنظيفها والتحقق منها.'};
 const sections=[['home','الرئيسية'],['questions','بنك الأسئلة'],['league','دوري أبطال نافس'],['certificates','الشهادات التلقائية'],['analysis','المحلل الذكي'],['assistant','المساعد الآلي'],['passport','جواز سفر نافس'],['classes','تحدي الفصول'],['readiness','مؤشر الاستعداد'],['archive','الأرشيف الذكي'],['documentation','مركز التوثيق والتقارير الرسمية'],['settings','لوحة الإدارة السرية'],['messages','رسائل الإنجاز']];
 let settings=null, questions=[], exams=[], attempts=[], certStudents=[], current='home', imported=[], portalArmed=false, documentation=null, documentVersions=[], documentationFiles=[];
 const API=(window.NAFIS_API_BASE||'').replace(/\/$/,''), $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
