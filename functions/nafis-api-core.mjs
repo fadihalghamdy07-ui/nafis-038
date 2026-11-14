@@ -86,10 +86,21 @@ async function bodyJson(request) {
 }
 function authAdmin(request, env) {
   const secret = env.NAFIS_SESSION_SECRET || '';
-  const value = request.headers.get('authorization') || '';
-  const token = value.startsWith('Bearer ') ? value.slice(7) : '';
+  const cookieName = '__Host-naf038_admin_session=';
+  const token = (request.headers.get('cookie') || '').split(';').map(part => part.trim())
+    .find(part => part.startsWith(cookieName))?.slice(cookieName.length) || '';
   const payload = secret ? readToken(token, secret) : null;
-  return payload?.role === 'admin' && payload.sub === (env.NAFIS_ADMIN_EMAIL || '').toLowerCase() ? payload : null;
+  return payload?.role === 'admin' && payload.sub === (env.NAFIS_ADMIN_EMAIL || '').trim().toLowerCase() ? payload : null;
+}
+function adminSessionCookie(token) {
+  return `__Host-naf038_admin_session=${token}; Path=/; Max-Age=28800; HttpOnly; Secure; SameSite=Strict`;
+}
+function clearAdminSessionCookie() {
+  return '__Host-naf038_admin_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict';
+}
+function sameOriginRequest(request) {
+  const origin = request.headers.get('origin');
+  return Boolean(origin && origin === new URL(request.url).origin);
 }
 function authExam(request, env) {
   const value = request.headers.get('authorization') || '';
@@ -179,7 +190,10 @@ function corsHeaders(request, env) {
 }
 function adminOnly(request, env) {
   const admin = authAdmin(request, env);
-  return admin || fail(401, 'admin_login_required', 'يلزم تسجيل دخول الإدارة.');
+  if (!admin) return fail(401, 'admin_login_required', 'يلزم تسجيل دخول الإدارة.');
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && !sameOriginRequest(request))
+    return fail(403, 'csrf_origin_rejected', 'تعذر التحقق من مصدر الطلب.');
+  return admin;
 }
 
 function validateDocumentation(value) {
@@ -637,7 +651,11 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
       }
       const issued = Math.floor(now() / 1000), exp = issued + 8 * 60 * 60;
       const token = signedToken({ sub: email, role: 'admin', iat: issued, exp }, env.NAFIS_SESSION_SECRET);
-      return json({ token, expires_at: exp, email }, 200, headers);
+      return json({ expires_at: exp, email }, 200, { ...headers, 'set-cookie': adminSessionCookie(token) });
+    }
+    if (request.method === 'POST' && path === '/auth/logout') {
+      if (!sameOriginRequest(request)) return fail(403, 'csrf_origin_rejected', 'تعذر التحقق من مصدر الطلب.');
+      return json({ ok: true }, 200, { ...headers, 'set-cookie': clearAdminSessionCookie() });
     }
     if (request.method === 'POST' && path === '/student/achievements/session') {
       if (!env.NAFIS_SESSION_SECRET) return fail(503, 'not_configured', 'لم يكتمل إعداد الحماية.');
