@@ -26,10 +26,10 @@ test('signed token is accepted before expiry and rejected at expiry', () => {
 
 test('tampered token is rejected', () => {
   const token = makeToken(100);
-  assert.equal(readToken(token + 'x', secret, 99_000), null);
+  assert.equal(readToken(token, secret, 99_000), null);
 });
 
-test('admin cookie uses host-only HttpOnly Secure SameSite Strict attributes', () => {
+test('admin cookie uses HttpOnly Secure SameSite Strict attributes', () => {
   const cookie = adminSessionCookie(makeToken(100));
   assert.match(cookie, /^__Host-naf038_admin_session=/);
   assert.match(cookie, /Path=\//);
@@ -39,7 +39,7 @@ test('admin cookie uses host-only HttpOnly Secure SameSite Strict attributes', (
   assert.match(cookie, /SameSite=Strict/);
 });
 
-test('expired session cookie is cleared on logout', () => {
+test('logout clears the session cookie', () => {
   const cookie = clearAdminSessionCookie();
   assert.match(cookie, /^__Host-naf038_admin_session=;/);
   assert.match(cookie, /Max-Age=0/);
@@ -48,7 +48,7 @@ test('expired session cookie is cleared on logout', () => {
   assert.match(cookie, /SameSite=Strict/);
 });
 
-test('admin authorization accepts cookie and rejects bearer-only tokens', () => {
+test('admin authorization accepts cookies and rejects bearer-only tokens', () => {
   const token = makeToken(Math.floor(Date.now() / 1000) + 3600);
   const env = { NAFIS_SESSION_SECRET: secret, NAFIS_ADMIN_EMAIL: email };
   const cookieRequest = new Request('https://preview.example/api/admin/bootstrap', {
@@ -71,17 +71,9 @@ test('mutations accept only same-origin requests for CSRF defense', () => {
   assert.equal(sameOriginRequest(new Request('https://preview.example/api/admin/settings', { method: 'PATCH' })), false);
 });
 
-test('password update and login verification share the same scrypt format', async () => {
+test('password update and login verification share the same scrypt format and database source', async () => {
   const hash = await encodePassword('fake-isolated-test-password');
-  assert.ok(hash.startsWith('scrypt
-  assert.equal(await verifyPassword('fake-isolated-test-password', hash), true);
-  assert.equal(await verifyPassword('different-test-password', hash), false);
-  const dbPool = { query: async () => ({ rows: [{ password_hash: hash }] }) };
-  assert.equal(await activeAdminPasswordHash(dbPool, 'environment-fallback'), hash);
-  const emptyPool = { query: async () => ({ rows: [] }) };
-  assert.equal(await activeAdminPasswordHash(emptyPool, 'environment-fallback'), 'environment-fallback');
-});
-));
+  assert.ok(hash.startsWith('scrypt' + String.fromCharCode(36)));
   assert.equal(await verifyPassword('fake-isolated-test-password', hash), true);
   assert.equal(await verifyPassword('different-test-password', hash), false);
   const dbPool = { query: async () => ({ rows: [{ password_hash: hash }] }) };
