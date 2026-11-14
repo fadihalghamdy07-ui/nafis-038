@@ -73,7 +73,15 @@ test('mutations accept only same-origin requests for CSRF defense', () => {
 
 test('password update and login verification share the same scrypt format', async () => {
   const hash = await encodePassword('fake-isolated-test-password');
-  assert.match(hash, /^scrypt\\$/);
+  assert.ok(hash.startsWith('scrypt
+  assert.equal(await verifyPassword('fake-isolated-test-password', hash), true);
+  assert.equal(await verifyPassword('different-test-password', hash), false);
+  const dbPool = { query: async () => ({ rows: [{ password_hash: hash }] }) };
+  assert.equal(await activeAdminPasswordHash(dbPool, 'environment-fallback'), hash);
+  const emptyPool = { query: async () => ({ rows: [] }) };
+  assert.equal(await activeAdminPasswordHash(emptyPool, 'environment-fallback'), 'environment-fallback');
+});
+));
   assert.equal(await verifyPassword('fake-isolated-test-password', hash), true);
   assert.equal(await verifyPassword('different-test-password', hash), false);
   const dbPool = { query: async () => ({ rows: [{ password_hash: hash }] }) };
