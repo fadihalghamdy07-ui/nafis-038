@@ -4,6 +4,7 @@ import { createHmac } from 'node:crypto';
 import {
   readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest,
   authAdmin, adminOnly, handleRequest, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash,
+  withPreviewTestSavepoint,
 } from '../functions/nafis-api-core.mjs';
 
 const secret = 'test-only-session-secret';
@@ -170,4 +171,34 @@ test('revocation fails closed when the credential version cannot be read', async
   assert.ok(result instanceof Response);
   assert.equal(result.status, 503);
   assert.equal((await result.json()).error, 'admin_session_revocation_unavailable');
+});
+
+test('Preview runner rolls back only a rejected request savepoint and can continue its outer transaction', async () => {
+  const snapshots = [];
+  let aborted = false;
+  const client = { async query(sql) {
+    const command = String(sql).toUpperCase();
+    if (command.startsWith('SAVEPOINT ')) { snapshots.push({ name: command.split(' ')[1], aborted }); return { rows: [] }; }
+    if (command.startsWith('ROLLBACK TO SAVEPOINT ')) {
+      const name = command.split(' ')[3];
+      const snapshot = [...snapshots].reverse().find(item => item.name === name);
+      if (!snapshot) throw new Error('missing savepoint');
+      aborted = snapshot.aborted;
+      return { rows: [] };
+    }
+    if (command.startsWith('RELEASE SAVEPOINT ')) { snapshots.pop(); return { rows: [] }; }
+    if (command === 'SIMULATE UNIQUE CONSTRAINT') { aborted = true; throw Object.assign(new Error('duplicate'), { code: '23505' }); }
+    if (command === 'SELECT 1') {
+      if (aborted) throw Object.assign(new Error('transaction aborted'), { code: '25P02' });
+      return { rows: [{ value: 1 }] };
+    }
+    throw new Error('Unexpected simulated query');
+  } };
+  const response = await withPreviewTestSavepoint(client, 'naf038_test_request_1', async () => {
+    try { await client.query('SIMULATE UNIQUE CONSTRAINT'); }
+    catch (error) { assert.equal(error.code, '23505'); return { status: 409 }; }
+  });
+  assert.equal(response.status, 409);
+  assert.deepEqual((await client.query('SELECT 1')).rows, [{ value: 1 }]);
+  assert.equal(snapshots.length, 0);
 });

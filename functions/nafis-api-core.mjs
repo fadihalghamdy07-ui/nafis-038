@@ -575,6 +575,18 @@ function previewTestPool(client) {
     }
   };
 }
+async function withPreviewTestSavepoint(client, point, operation) {
+  await client.query('SAVEPOINT '+point);
+  try {
+    const response=await operation();
+    if(response.status>=400)await client.query('ROLLBACK TO SAVEPOINT '+point);
+    await client.query('RELEASE SAVEPOINT '+point);
+    return response;
+  } catch(error) {
+    try { await client.query('ROLLBACK TO SAVEPOINT '+point); await client.query('RELEASE SAVEPOINT '+point); } catch {}
+    throw error;
+  }
+}
 async function previewTestIdentity(pool,env) {
   if(env.VERCEL_ENV!=='preview'||env.VERCEL_GIT_COMMIT_REF!=='vercel-backend-ready')return false;
   const {rows}=await pool.query("SELECT current_database() AS database_name,current_setting('neon.project_id',true) AS neon_project_id,current_setting('neon.branch_id',true) AS neon_branch_id");
@@ -586,9 +598,14 @@ async function previewTestRun(pool,env,adminCookie) {
   if(env.NAFIS_STUDENT_PORTAL_ENABLED==='true'||!env.NAFIS_SESSION_SECRET)return {status:423,body:{error:'preview_test_precondition_failed'}};
   let client,transaction=false,stage='preflight',checks={};
   const check=(name,ok)=>{if(!ok)throw Object.assign(new Error('preview_assertion'),{testStage:name});checks[name]=true;};
+  let requestSavepoint=0;
   const call=async(path,method='GET',body=null,headers={},when=Date.now(),testPool=null,testEnv=null)=>{
     const request=new Request('https://nafis-preview-test.invalid'+path,{method,headers:{...(body?{'content-type':'application/json'}:{}),...headers},...(body?{body:JSON.stringify(body)}:{})});
-    return handleRequest(request,{pool:testPool||txPool,env:testEnv||simulatedEnv,now:()=>when});
+    // A handler may intentionally return 4xx after a database constraint error (for
+    // example, the second submission). PostgreSQL aborts the active transaction on
+    // that error, so isolate every simulated request and roll back only its savepoint.
+    const point='naf038_test_request_'+(++requestSavepoint);
+    return withPreviewTestSavepoint(client,point,()=>handleRequest(request,{pool:testPool||txPool,env:testEnv||simulatedEnv,now:()=>when}));
   };
   let txPool,simulatedEnv,runId='',certificateWeek='',certificateExamId=0,studentRows=[],names=[];
   try {
@@ -1147,4 +1164,4 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
   }
 }
 
-export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb, readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest, authAdmin, hasCurrentCredentialVersion, adminOnly, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash };
+export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb, readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest, authAdmin, hasCurrentCredentialVersion, adminOnly, ADMIN_SESSION_TTL_SECONDS, encodePassword, verifyPassword, activeAdminPasswordHash, withPreviewTestSavepoint };
