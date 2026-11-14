@@ -7,6 +7,7 @@ const GRADES = new Map([[1, 'الأول متوسط'], [2, 'الثاني متوس
 const SUBJECTS = new Set(['لغتي', 'الرياضيات', 'العلوم']);
 const LETTERS = ['أ', 'ب', 'ج', 'د', 'هـ', 'و'];
 const MAX_BODY_BYTES = 1_000_000;
+const ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60;
 const loginAttempts = new Map();
 const studentCodeAttempts = new Map();
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), {
@@ -65,7 +66,7 @@ function signedToken(payload, secret) {
   const sig = createHmac('sha256', secret).update(body).digest('base64url');
   return `${body}.${sig}`;
 }
-function readToken(token, secret) {
+function readToken(token, secret, nowMs = Date.now()) {
   if (typeof token !== 'string' || token.length > 2048) return null;
   const [body, sig, extra] = token.split('.');
   if (!body || !sig || extra) return null;
@@ -75,7 +76,7 @@ function readToken(token, secret) {
   if (received.length !== expected.length || !timingSafeEqual(received, expected)) return null;
   try {
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    return payload.exp > Math.floor(Date.now() / 1000) ? payload : null;
+    return payload.exp > Math.floor(nowMs / 1000) ? payload : null;
   } catch { return null; }
 }
 async function bodyJson(request) {
@@ -93,7 +94,7 @@ function authAdmin(request, env) {
   return payload?.role === 'admin' && payload.sub === (env.NAFIS_ADMIN_EMAIL || '').trim().toLowerCase() ? payload : null;
 }
 function adminSessionCookie(token) {
-  return `__Host-naf038_admin_session=${token}; Path=/; Max-Age=28800; HttpOnly; Secure; SameSite=Strict`;
+  return `__Host-naf038_admin_session=${token}; Path=/; Max-Age=${ADMIN_SESSION_TTL_SECONDS}; HttpOnly; Secure; SameSite=Strict`;
 }
 function clearAdminSessionCookie() {
   return '__Host-naf038_admin_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict';
@@ -629,6 +630,7 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
         total_attempts:results.length }, 200, headers);
     }
     if (request.method === 'POST' && path === '/auth/login') {
+      if (!sameOriginRequest(request)) return fail(403, 'csrf_origin_rejected', 'تعذر التحقق من مصدر الطلب.');
       const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
       if (!requestLimiter(ip)) {
         console.info('naf038_admin_login_denied', { reason: 'rate_limited' });
@@ -649,7 +651,7 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
         console.info('naf038_admin_login_denied', { reason });
         return fail(401, 'invalid_login', 'بيانات الدخول غير صحيحة.');
       }
-      const issued = Math.floor(now() / 1000), exp = issued + 8 * 60 * 60;
+      const issued = Math.floor(now() / 1000), exp = issued + ADMIN_SESSION_TTL_SECONDS;
       const token = signedToken({ sub: email, role: 'admin', iat: issued, exp }, env.NAFIS_SESSION_SECRET);
       return json({ expires_at: exp, email }, 200, { ...headers, 'set-cookie': adminSessionCookie(token) });
     }
@@ -886,4 +888,4 @@ async function handleRequest(request, { pool, env = process.env, now = () => Dat
   }
 }
 
-export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb };
+export { handleRequest, weekDate, weekKey, announcementAt, answerLetter, optionTexts, validateDb, readToken, adminSessionCookie, clearAdminSessionCookie, sameOriginRequest, authAdmin, ADMIN_SESSION_TTL_SECONDS };
