@@ -49,7 +49,7 @@ test('expired session cookie is cleared on logout', () => {
 });
 
 test('admin authorization accepts cookie and rejects bearer-only tokens', () => {
-  const token = makeToken(100);
+  const token = makeToken(Math.floor(Date.now() / 1000) + 3600);
   const env = { NAFIS_SESSION_SECRET: secret, NAFIS_ADMIN_EMAIL: email };
   const cookieRequest = new Request('https://preview.example/api/admin/bootstrap', {
     headers: { cookie: '__Host-naf038_admin_session=' + token },
