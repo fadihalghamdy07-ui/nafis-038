@@ -730,7 +730,8 @@ async function previewTestRun(pool,env,adminCookie) {
     return {status:200,body:{ok:true,run_id:runId,certificate_week:certificateWeek,active_week:original.current_week,fake_students:4,fake_attempts:8,checks},setCookie:activeCookie};
   } catch(error) {
     if(transaction&&client){try{await client.query('ROLLBACK');}catch{}}
-    return {status:Number(error?.httpStatus)||500,body:{error:error?.httpStatus?'preview_test_precondition_failed':'preview_test_failed',stage:error?.testStage||stage,checks}};
+    const dbCode=/^[0-9A-Z]{5}$/.test(String(error?.code||''))?String(error.code):undefined;
+    return {status:Number(error?.httpStatus)||500,body:{error:error?.httpStatus?'preview_test_precondition_failed':'preview_test_failed',stage:error?.testStage||stage,checks,...(dbCode?{db_code:dbCode}:{})}};
   } finally {if(client)client.release();}
 }
 async function previewTestCleanup(pool,env,body) {
