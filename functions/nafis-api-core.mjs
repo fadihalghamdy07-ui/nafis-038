@@ -596,7 +596,7 @@ async function previewTestIdentity(pool,env) {
 async function previewTestRun(pool,env,adminCookie) {
   if(!(await previewTestIdentity(pool,env)))return {status:403,body:{error:'preview_isolation_not_verified'}};
   if(env.NAFIS_STUDENT_PORTAL_ENABLED==='true'||!env.NAFIS_SESSION_SECRET)return {status:423,body:{error:'preview_test_precondition_failed'}};
-  let client,transaction=false,stage='preflight',checks={};
+  let client,transaction=false,stage='preflight',checks={},baseCounts=null;
   const check=(name,ok)=>{if(!ok)throw Object.assign(new Error('preview_assertion'),{testStage:name});checks[name]=true;};
   let requestSavepoint=0;
   const call=async(path,method='GET',body=null,headers={},when=Date.now(),testPool=null,testEnv=null)=>{
@@ -614,6 +614,7 @@ async function previewTestRun(pool,env,adminCookie) {
     stage='base_empty_guard';
     const base=await client.query("SELECT (SELECT COUNT(*)::int FROM public.nafis_students) AS students,(SELECT COUNT(*)::int FROM public.naf038_exams) AS exams,(SELECT COUNT(*)::int FROM public.naf038_questions) AS questions,(SELECT COUNT(*)::int FROM public.naf038_attempts) AS attempts,(SELECT COUNT(*)::int FROM public.naf038_drafts) AS drafts,(SELECT COUNT(*)::int FROM public.naf038_student_access) AS accesses");
     const counts=base.rows[0]||{};
+    baseCounts=Object.fromEntries(Object.entries(counts).map(([k,v])=>[k,Number(v)||0]));
     checks.preview_database_isolated=true;checks.student_portal_closed=true;
     if(Object.values(counts).some(value=>Number(value)!==0))throw Object.assign(new Error('unsafe_nonempty_preview'),{httpStatus:409,testStage:'base_empty_guard'});
     txPool=previewTestPool(client);
@@ -748,7 +749,7 @@ async function previewTestRun(pool,env,adminCookie) {
   } catch(error) {
     if(transaction&&client){try{await client.query('ROLLBACK');}catch{}}
     const dbCode=/^[0-9A-Z]{5}$/.test(String(error?.code||''))?String(error.code):undefined;
-    return {status:Number(error?.httpStatus)||500,body:{error:error?.httpStatus?'preview_test_precondition_failed':'preview_test_failed',stage:error?.testStage||stage,checks,...(dbCode?{db_code:dbCode}:{})}};
+    return {status:Number(error?.httpStatus)||500,body:{error:error?.httpStatus?'preview_test_precondition_failed':'preview_test_failed',stage:error?.testStage||stage,checks,...(dbCode?{db_code:dbCode}:{}),...(baseCounts?{base_counts:baseCounts}:{})}};
   } finally {if(client)client.release();}
 }
 async function previewTestCleanup(pool,env,body) {
